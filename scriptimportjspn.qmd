@@ -5,26 +5,7 @@ format: html
 editor: visual
 ---
 
-## Quarto
-
-Quarto enables you to weave together content and executable code into a finished document. To learn more about Quarto see <https://quarto.org>.
-
-## Running Code
-
-When you click the **Render** button a document will be generated that includes both content and the output of embedded code. You can embed code like this:
-
-```{r}
-1 + 1
-```
-
-You can add options to executable code like this
-
-```{r}
-#| echo: false
-2 * 2
-```
-
-The `echo: false` option disables the printing of code (only output is displayed).
+## Chargement library
 
 ```{r}
 library(odbc) # provides drivers to connect to different SQL dialects
@@ -34,8 +15,9 @@ library(tidyverse) # Data science tools
 library(mapview) # Visu rapide et dynamique des objets spatiaux
 ```
 
-```{r}
+## Connexion à la BD
 
+```{r}
 con<- dbConnect(odbc::odbc(),
  Driver = "PostgreSQL Unicode",
  Database = "projet_final",
@@ -45,8 +27,9 @@ con<- dbConnect(odbc::odbc(),
 )
 ```
 
-```{sql}
+## stations bixi
 
+```{sql}
 CREATE EXTENSION IF NOT EXISTS postgis;
 CREATE SCHEMA IF NOT EXISTS data;
 
@@ -64,7 +47,4 @@ CREATE TABLE data.bixi_stations (
 
 CREATE TEMP TABLE tmp_bixi (data jsonb);
 COPY tmp_bixi FROM '/chemin/vers/bixi.json';  -- chemin côté serveur PostgreSQL
-
-
-
 ```
