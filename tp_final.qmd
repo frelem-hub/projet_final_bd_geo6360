@@ -1,0 +1,170 @@
+---
+title: "tp_final"
+author: "Yaye Aissatou Gueye, Frédéric Lemyre-Corbeil, Robin Durand"
+format: html
+editor: visual
+execute:
+  eval: false
+---
+
+## Chargement library
+
+```{r}
+library(odbc) # provides drivers to connect to different SQL dialects
+library(DBI)  # provides functions to interact with the database
+library(sf) # Bibliothèque pour l'analyse et traitement des données spatiales
+library(tidyverse) # Data science tools
+library(mapview) # Visu rapide et dynamique des objets spatiaux
+```
+
+## Connexion à la BD
+
+```{r}
+con<- dbConnect(odbc::odbc(),
+ Driver = "PostgreSQL Unicode",
+ Database = "projet_final",
+ Server = "localhost",
+ UID = "postgres",
+ PWD = "donneeslemig2025" # Ne jamais diffuser un mdp personnel
+)
+```
+
+## stations bixi
+
+```{sql, connection = con}
+
+CREATE EXTENSION IF NOT EXISTS postgis;
+CREATE SCHEMA IF NOT EXISTS data;
+
+-- création d'une table dans la bd pour accueillir les données du json des bixis qui seront manipulables par la suite. On règle les champs pour mimer le contenu du json. (postgres ne prend pas les json comme formats natifs).
+
+DROP TABLE IF EXISTS data.bixi_stations; -- passe pour possibilité de réexécution du code
+
+CREATE TABLE data.bixi_stations (
+    station_id   TEXT PRIMARY KEY,
+    external_id  TEXT,
+    name         TEXT,
+    short_name   TEXT,
+    capacity     INTEGER,
+    rental_methods TEXT[],
+    is_charging  BOOLEAN,
+    has_kiosk    BOOLEAN,
+    geom         GEOMETRY(Point, 4326)
+);
+
+-- création d'une table temporaire dans la bd pour accueillir les données brutes du json des bixi qui pourront être transférées dans la table crée précédemment (postgres ne prend pas les json comme formats natifs)
+
+DROP TABLE IF EXISTS tmp_bixi;
+
+CREATE TEMP TABLE tmp_bixi (data jsonb);
+```
+
+```{r}
+
+# passe en r pout accéder au fichier avec un chemin de client local
+
+bixi_raw <- readr::read_file("U:/projet_final/bixi.json")
+DBI::dbExecute(con, "INSERT INTO tmp_bixi VALUES (?)", list(bixi_raw))
+```
+
+```{sql, connection = con}
+
+-- import des données brutes de la table temporaire vers notre vraie table (postgres ne prend pas les json comme formats natifs)
+
+INSERT INTO data.bixi_stations
+SELECT
+    elem->>'station_id',
+    elem->>'external_id',
+    elem->>'name',
+    elem->>'short_name',
+    (elem->>'capacity')::int,
+    ARRAY(SELECT jsonb_array_elements_text(elem->'rental_methods')),
+    (elem->>'is_charging')::boolean,
+    (elem->>'has_kiosk')::boolean,
+    ST_SetSRID(ST_MakePoint((elem->>'lon')::float, (elem->>'lat')::float), 4326) -- ici dans le json d'origine on as les coordonées lon lat, alors ont utilise ST_MakePoint pour créer la géométrie
+FROM tmp_bixi, jsonb_array_elements(data->'data'->'stations') AS elem ON CONFLICT (station_id) DO NOTHING; -- passe pour possibilité de réexécution du code
+```
+
+## réseau viaire
+
+```{sql, connection = con}
+
+CREATE EXTENSION IF NOT EXISTS postgis;
+CREATE SCHEMA IF NOT EXISTS data;
+
+DROP TABLE IF EXISTS data.bixi_stations; -- passe pour possibilité de réexécution du code
+
+CREATE TABLE data.bixi_stations (
+    station_id   TEXT PRIMARY KEY,
+    external_id  TEXT,
+    name         TEXT,
+    short_name   TEXT,
+    capacity     INTEGER,
+    rental_methods TEXT[],
+    is_charging  BOOLEAN,
+    has_kiosk    BOOLEAN,
+    geom         GEOMETRY(Point, 4326)
+);
+
+DROP TABLE IF EXISTS tmp_bixi;
+
+CREATE TEMP TABLE tmp_bixi (data jsonb);
+```
+
+```{r}
+bixi_raw <- readr::read_file("U:/projet_final/bixi.json")
+DBI::dbExecute(con, "INSERT INTO tmp_bixi VALUES (?)", list(bixi_raw))
+```
+
+```{sql, connection = con}
+
+INSERT INTO data.bixi_stations
+SELECT
+    elem->>'station_id',
+    elem->>'external_id',
+    elem->>'name',
+    elem->>'short_name',
+    (elem->>'capacity')::int,
+    ARRAY(SELECT jsonb_array_elements_text(elem->'rental_methods')),
+    (elem->>'is_charging')::boolean,
+    (elem->>'has_kiosk')::boolean,
+    ST_SetSRID(ST_MakePoint((elem->>'lon')::float, (elem->>'lat')::float), 4326)
+FROM tmp_bixi, jsonb_array_elements(data->'data'->'stations') AS elem ON CONFLICT (station_id) DO NOTHING; -- passe pour possibilité de réexécution du code
+
+```
+
+## Installation de pgrouting
+
+```{sql, connection = con}
+--installation de pgrouting
+CREATE EXTENSION IF NOT EXISTS pgrouting;
+
+```
+
+## Géocodage
+### test adresses
+```{r}
+adresse_depart <- "275 Rue Notre-Dame Est, Montréal, QC H2Y 1C6"
+adresse_arrivee <- "4450 Rue Saint-Hubert, Montréal, QC H2J 2W9"
+```
+```{r}
+library(tidygeocoder)
+# ??tidygeocoder
+
+# Récupération des coordonnées liées à l'adresse avec fonction geo()
+coord_depart<- tidygeocoder::geo(address = adresse_depart, method = "osm", verbose = TRUE, full_results = TRUE)
+  
+# Transformation en objet spatial avec st_as_sf()
+# ?st_as_sf()
+depart_sf <- sf::st_as_sf(coord_depart, coords = c("long", "lat"),crs = 4326)%>%
+  select(osm_id, address, geometry)%>%
+  rename(geog = geometry)
+# mapview(depart_sf) # Check visuel du résultat
+
+# Même chose pour l'adresse d'arrivée
+coord_arrivee<- geo(address = adresse_arrivee, method = "osm", verbose = TRUE, full_results = TRUE)
+arrivee_sf <- sf::st_as_sf(coord_arrivee, coords = c("long", "lat"),crs = 4326) %>%
+  select(osm_id, address, geometry)%>%
+  rename(geog = geometry)
+
+```

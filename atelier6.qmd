@@ -1,0 +1,348 @@
+---
+title: "Atelier 6"
+author: "Thibault Le Corre"
+format: html
+editor: visual
+execute:
+  eval: false
+---
+
+```{r}
+library(odbc) # provides drivers to connect to different SQL dialects
+library(DBI)  # provides functions to interact with the database
+```
+
+## Connexion à la BD
+
+Connectez vous à votre BD avec le package ODB à partir du code ci-dessous. Création d'un objet de connection 'con'.
+
+```{r}
+
+con<- dbConnect(odbc::odbc(),
+ Driver = "PostgreSQL Unicode",
+ Database = "h26_geo6360_s3",
+ Server = "localhost",
+ UID = "postgres",
+ PWD = "donneeslemig2025" # Ne jamais diffuser un mdp personnel
+)
+```
+
+Une fois la connexion établie, au niveau de `Connections`vous devriez alors pouvoir suivre l'ensemble de l’arborescence de votre BD avec les schémas, les tables, vues, vues matérialisées... vous pouvez également utiliser directement des scripts SQL dans votre Quarto.
+
+## Installation de pgrouting (bibliothèque de routage pour PostGIS)
+
+Dans l'entête en {}, on précise le langage de programmation et la connection (appelée 'con' ici).
+
+La création de l'extension pgrouting se fait à partir du code suivant. Toute la doc de l'extension est [disponible ici](https://docs.pgrouting.org/latest/en/index.html). N'hésitez pas à chercher d'autres exemples pratiques sur le web. Par exemple la doc de la [suite osgeo](https://live.osgeo.org/fr/quickstart/pgrouting_quickstart.html) est plutôt bien réalisée (même si un peu ancienne). Sinon un exemple complet d’application est [disponible ici](https://github.com/planetfederal/workshops/blob/master/tutorials/osm-routing/src/index.rst) (très bonne documentation).
+
+```{sql, connection = con}
+--installation de pgrouting
+CREATE EXTENSION IF NOT EXISTS pgrouting;
+
+```
+
+## Création des Index spatiaux
+
+Une étape souvent mise de côté et pourant très utile est celle de la création des index spatiaux qui permet de travailler sur des données volumineuses et de gagner en performance.
+
+```{sql, connection = con}
+-- Création des index
+CREATE INDEX IF NOT EXISTS idx_geom_nyc_street ON data.nyc_street USING gist(geom); -- création de mon objet index sur les rues
+CREATE INDEX IF NOT EXISTS idx_geom_bar ON data.bar USING gist(geom); -- création de mon objet index sur les bars...
+CREATE INDEX IF NOT EXISTS idx_geom_station ON data.nyc_subway_station USING gist(geom); -- création de mon objet index sur les stations...
+```
+
+## Création d'un nouveau schéma pour l'analyse
+
+A des finds d'analyse, j'ai créé un nouveau schéma qui se nomme analyse_pgrouting. Le principe est de stocker les objets issus de l'analyse sans modifier le schéma et objets des données sources stockée et préparées pour l'analyse.
+
+```{sql, connection = con}
+--Ajout schéma
+CREATE SCHEMA IF NOT EXISTS analyse_pgrouting
+    AUTHORIZATION postgres;
+```
+
+Ne pas oublier de repréciser les chemins d'accès aux fonctions et composantes.
+
+```{sql, connection = con}
+SET search_path = analyse_pgrouting, data, public;
+```
+
+## Ajout des colonnes nécessaires pour créer topologie
+
+L'algorithme du calcul du plus court chemin se nomme '[pgr_dijkstra](https://docs.pgrouting.org/latest/en/pgr_dijkstra.html)'.Comme vous pouvez vous en rendre compte dans la documentation, l'algorithme nécessite plusieurs arguments d'entrée et fonctionne pour des relations 1:1, 1:n et N:M des objets de l'analyse. Dans notres cas, comme la consigne le suppose ici, on doit trouver le plus court chemin entre deux objets ponctuels, soit de 1:1. Pour ce faire, nos données sur le réseau de rues à NYC nécessitent d'identifier, pour chaque arrête (Edge), le noeud de départ de l'action et le noeud d'arrivée sur le réseau.
+
+Concrètement, supposons que je cherche à identifier le plus court chemin depuis une station au Nord de l'île de Manhattan afin de me rendre au bar le plus au sud de l'île dans mon jeu de données. Pour ce faire j'explore très rapidement mes deux couches sur Qgis et je sélectionne la station de la 157ème rue (id_station = 28) et le "Havana Club", un bar au sud de Manhattan (fullid = n12339677014).
+
+La première étape consite à préparer les objets de l'analyse et stocker ces objets dans le schéma de l'analyse dès qu'ils sont modifiés. Dans notre cas, trois tables dans notre schéma 'data' devront être mobilisées : la table des stations (lieu de départ), la table des bars (lieu d'arrivée) et la table du réseau (chemin pris pour aller du lieu de départ au lieu d'arrivée). Sauf que chacune des tables doivent être modifiées : en sélectionnant des entités (filtrage) ou en ajoutant/supprimant des colonnes (enrichissement/réduction). Ces tables modifiées sont alors appelées dans le schéma d'analyse pour ne pas perturber l'organisation des données dans le schéma de stockage des données brutes.
+
+Començons par la table des stations, qui dans notre cas deviendra une entité d'analyse nommée pt_depart.
+
+```{sql, connection = con}
+-- filtrage 
+CREATE TABLE IF NOT EXISTS analyse_pgrouting.pt_depart AS (
+SELECT *
+FROM data.nyc_subway_station
+WHERE id_station = '28'
+)
+
+```
+
+Faisons la même chose pour le point d'arrivée qui sont les bars que l'on nomme 'pt_arrivee'. Cette fois, je me rends compte qu'il ya trop de variables et je souhaite uniquement préserver celles nécessaires.
+
+```{sql, connection = con}
+DROP TABLE IF EXISTS analyse_pgrouting.pt_arrivee;
+-- filtrage et suppression colonne
+CREATE TABLE analyse_pgrouting.pt_arrivee AS (
+SELECT full_id, geom
+FROM data.bar
+WHERE full_id = 'n12339677014'
+)
+
+```
+
+Enfin la dernière table que nous devons ajouter dans l'analyse est celle du réseau. Comme je suis agnostique sur le chemin à prendre (je ne fais aucune hypothèse), je prends l'ensemble de la table des données sources et je nommerai cette table comme 'reseau'. Ici je sélectionne uniquement la PK et la geométrie.
+
+```{sql, connection = con}
+DROP TABLE IF EXISTS analyse_pgrouting.reseau;
+-- filtrage et suppression colonne
+CREATE TABLE analyse_pgrouting.reseau AS (
+SELECT id_street::BIGINT, geom
+FROM data.nyc_street
+)
+
+```
+
+Cela n'est pas tout, d['après la documentation](https://docs.pgrouting.org/latest/en/pgr_extractVertices.html#edges-sql)mes objets doivent être de type Linestring. Si ce n'est pas le cas il faut donc les modifier.
+
+```{sql, connection = con}
+
+SELECT DISTINCT ST_GeometryType(geom) FROM analyse_pgrouting.reseau;
+```
+
+```{sql, connection = con}
+-- Supprimer ancienne table si nécessaire
+DROP TABLE IF EXISTS analyse_pgrouting.reseau;
+
+-- Transformer les MULTILINESTRING en LINESTRING
+CREATE TABLE analyse_pgrouting.reseau AS
+SELECT id_street::BIGINT,
+    (ST_Dump(geom)).geom AS geom
+FROM data.nyc_street;
+```
+
+On crée un index spatial par-dessus
+
+```{sql, connection = con}
+CREATE INDEX IF NOT EXISTS idx_geom_reseau ON analyse_pgrouting.reseau USING gist(geom); -- création de mon objet index sur le réseau 
+```
+
+Les étapes de préparation ne sont pas terminées.
+
+## Ajout des colonnes nécessaires pour créer topologie réseau
+
+Voir la documentation de pgr_createTopology pour plus de précisions. Effectivement, d'après la documentation j'ai créé dans ma table du réseau, une variable nommée "source", représentant le point de départ sur mon réseau, une variable nommée target, représentant le point d'arrivée, et une variable cost qui va permettre de calculer le poids de chaque tronçon pour estimer le cout du déplacement. Ce cout est exprimé ici comm une distance en mètre.
+
+```{sql, connection = con}
+-- Colonne source
+ALTER TABLE analyse_pgrouting.reseau DROP COLUMN  IF EXISTS source;
+ALTER TABLE  analyse_pgrouting.reseau ADD COLUMN "source" BIGINT;
+
+--Colonnes target
+ALTER TABLE  analyse_pgrouting.reseau DROP COLUMN IF EXISTS target;
+ALTER TABLE  analyse_pgrouting.reseau ADD COLUMN "target" BIGINT;
+
+-- Ajouter une var sur la longueur de chaque tronçon
+ALTER TABLE  analyse_pgrouting.reseau DROP COLUMN IF EXISTS cost;
+ALTER TABLE  analyse_pgrouting.reseau ADD COLUMN cost REAL;
+
+UPDATE  analyse_pgrouting.reseau 
+SET cost = ST_Length(geom::geography); -- calcul sur l'elliposide en m.
+
+```
+
+Mais ce n'est pas suffisant. L'algorithme ne se base pas sur un calcul basé sur un objet strictement spatial mais plutôt sur un objet de type graphe. Cela suppose que l'on doit recomposer ce graphe à partir des objets de type 'Edges SQL' comme indiqué dans la documentation. Cette recomposition se base sur le principe de la topologie, c'est à dire de la relation entre chaque noeud du graphe.
+
+```{sql, connection = con}
+DROP TABLE IF EXISTS analyse_pgrouting.reseau_vertices;
+SELECT * INTO analyse_pgrouting.reseau_vertices
+FROM pgr_extractVertices(
+    'SELECT id_street AS id, geom FROM analyse_pgrouting.reseau'::text
+    )
+    ;
+
+```
+
+```{sql, connection = con}
+-- Associer arrêtes et noeuds point de départ
+UPDATE analyse_pgrouting.reseau AS r
+SET source = v.id
+FROM analyse_pgrouting.reseau_vertices AS v
+WHERE ST_Equals(ST_StartPoint(r.geom), v.geom);
+
+
+```
+
+```{sql, connection = con}
+-- Associer arrêtes et noeuds point d'arrivée
+UPDATE analyse_pgrouting.reseau AS r
+SET target = v.id
+FROM analyse_pgrouting.reseau_vertices AS v
+WHERE ST_Equals(ST_EndPoint(r.geom), v.geom);
+
+```
+
+## Linear referencing
+
+Comme nous n'avons pas directement nos objets sur le réseau, il est indispensable de tagger (linear referencing) chaque station et bar à un point (le plus proche) du réseau (de rues), l'idée est de créer une table de liaison.
+
+```{sql, connection = con}
+
+
+DROP TABLE IF EXISTS analyse_pgrouting.pt_depart_reseau;
+CREATE TABLE analyse_pgrouting.pt_depart_reseau AS
+SELECT DISTINCT ON (s.id_station)
+s.id_station , 
+n.id AS id_noeud, ST_Distance(ST_Transform(s.geom, 32118), ST_Transform(n.geom,32118)) AS distance,
+n.geom -- géométrie des neouds
+FROM analyse_pgrouting.pt_depart AS s
+JOIN analyse_pgrouting.reseau_vertices AS n
+ON ST_DWithin(ST_Transform(s.geom, 32118), ST_Transform(n.geom,32118), 5000)  -- Distance max de 5000m
+ORDER BY id_station, distance ASC ;	
+
+
+```
+
+```{sql, connection = con}
+
+DROP TABLE IF EXISTS analyse_pgrouting.pt_arrivee_reseau;
+CREATE TABLE analyse_pgrouting.pt_arrivee_reseau AS
+SELECT DISTINCT ON (s.full_id)
+s.full_id,
+n.id AS id_noeud, ST_Distance(ST_Transform(s.geom, 32118), ST_Transform(n.geom,32118)) AS distance,
+n.geom -- géométrie des neouds
+FROM analyse_pgrouting.pt_arrivee AS s
+JOIN analyse_pgrouting.reseau_vertices AS n
+ON ST_DWithin(ST_Transform(s.geom, 32118), ST_Transform(n.geom,32118), 5000)  -- Distance max de 5000m
+ORDER BY full_id, distance ASC ;	
+```
+
+## Calcul plus court chemin
+
+```{sql, connection = con}
+-- Ajouter une var reverse_cost
+ALTER TABLE  analyse_pgrouting.reseau DROP COLUMN IF EXISTS reverse_cost;
+ALTER TABLE  analyse_pgrouting.reseau ADD COLUMN reverse_cost REAL;
+UPDATE  analyse_pgrouting.reseau SET reverse_cost = ST_Length(geom::geography);
+
+```
+
+```{sql, connection = con}
+
+DROP TABLE IF EXISTS analyse_pgrouting.shpath;
+CREATE TABLE analyse_pgrouting.shpath AS
+SELECT * 
+FROM pgr_dijkstra(
+    'SELECT id_street AS id, source::INT4, target::INT4, cost, reverse_cost FROM analyse_pgrouting.reseau'::text,
+      ARRAY(SELECT id_noeud  FROM analyse_pgrouting.pt_depart_reseau), -- noeud de départ
+      ARRAY(SELECT id_noeud  FROM analyse_pgrouting.pt_arrivee_reseau),   -- noeud d'arrivée
+   false -- non dirigé
+);
+```
+
+## Deuxième procédure
+
+Solution alternative mais avec fonction dépréciée 'createTopology'.
+
+```{sql, connection = con}
+-- Colonne source
+ALTER TABLE analyse_pgrouting.reseau DROP COLUMN  IF EXISTS source;
+ALTER TABLE  analyse_pgrouting.reseau ADD COLUMN "source" BIGINT;
+
+--Colonnes target
+ALTER TABLE  analyse_pgrouting.reseau DROP COLUMN IF EXISTS target;
+ALTER TABLE  analyse_pgrouting.reseau ADD COLUMN "target" BIGINT;
+
+-- Ajouter une var sur la longueur de chaque tronçon
+ALTER TABLE  analyse_pgrouting.reseau DROP COLUMN IF EXISTS cost;
+ALTER TABLE  analyse_pgrouting.reseau ADD COLUMN cost REAL;
+
+UPDATE  analyse_pgrouting.reseau 
+SET cost = ST_Length(geom::geography); -- calcul sur l'elliposide en m.
+
+```
+
+```{sql, connection = con}
+DROP TABLE IF EXISTS analyse_pgrouting.reseau_vertices_pgr;
+SELECT * FROM pgr_createTopology(
+    'analyse_pgrouting.reseau',
+    0.005, -- application d'un seuil de tolérance élevé
+    'geom',
+    'id_street'
+);
+
+```
+
+```{sql, connection = con}
+
+DROP TABLE IF EXISTS analyse_pgrouting.pt_depart_reseau;
+CREATE TABLE analyse_pgrouting.pt_depart_reseau AS
+SELECT DISTINCT ON (s.id_station)
+s.id_station , 
+n.id AS id_noeud, ST_Distance(ST_Transform(s.geom, 4326), ST_Transform(n.the_geom,4326)) AS distance,
+n.the_geom AS geom -- géométrie des neouds
+FROM analyse_pgrouting.pt_depart AS s
+JOIN analyse_pgrouting.reseau_vertices_pgr AS n
+ON ST_DWithin(ST_Transform(s.geom, 4326), ST_Transform(n.the_geom,4326), 0.01)  -- Distance max de 5000m
+ORDER BY id_station, distance ASC ;	
+
+
+```
+
+```{sql, connection = con}
+
+DROP TABLE IF EXISTS analyse_pgrouting.pt_arrivee_reseau;
+CREATE TABLE analyse_pgrouting.pt_arrivee_reseau AS
+SELECT DISTINCT ON (s.full_id)
+s.full_id,
+n.id AS id_noeud, ST_Distance(ST_Transform(s.geom, 4326), ST_Transform(n.the_geom,4326)) AS distance,
+n.the_geom AS geom  -- géométrie des neouds
+FROM analyse_pgrouting.pt_arrivee AS s
+JOIN analyse_pgrouting.reseau_vertices_pgr AS n
+ON ST_DWithin(ST_Transform(s.geom, 4326), ST_Transform(n.the_geom,4326), 0.01)  -- Distance max de 5000m
+ORDER BY full_id, distance ASC ;	
+```
+
+```{sql, connection = con}
+
+DROP TABLE IF EXISTS analyse_pgrouting.shpath;
+CREATE TABLE analyse_pgrouting.shpath AS
+SELECT * 
+FROM pgr_dijkstra(
+    'SELECT id_street AS id, source::INT4, target::INT4, cost, reverse_cost FROM analyse_pgrouting.reseau'::text,
+      (SELECT id_noeud  FROM analyse_pgrouting.pt_depart_reseau), -- noeud de départ
+      (SELECT id_noeud  FROM analyse_pgrouting.pt_arrivee_reseau),   -- noeud d'arrivée
+   false -- non dirigé
+);
+```
+
+## Jointure avec le reste du réseau
+
+```{sql, connection = con}
+
+DROP TABLE IF EXISTS analyse_pgrouting.shpath_geom;
+
+CREATE TABLE analyse_pgrouting.shpath_geom AS
+SELECT   sp.seq,            -- séquence du chemin
+    sp.node,           -- noeud actuel
+    sp.edge,           -- id de l’arête
+    sp.cost,           -- coût de l’arête
+    r.id_street,       -- id de la rue
+    r.geom,            -- géométrie de la rue
+    r.reverse_cost,    -- coût inverse
+    r.source,
+    r.target
+FROM analyse_pgrouting.shpath AS sp
+LEFT JOIN analyse_pgrouting.reseau AS r
+    ON sp.edge = r.id_street;
+```
