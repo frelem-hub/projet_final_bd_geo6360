@@ -1,30 +1,13 @@
+```{sql connection=}
+
+```
+
 ---
 title: "merdouille"
 author: "flc"
 format: html
 editor: visual
 ---
-
-## Quarto
-
-Quarto enables you to weave together content and executable code into a finished document. To learn more about Quarto see <https://quarto.org>.
-
-## Running Code
-
-When you click the **Render** button a document will be generated that includes both content and the output of embedded code. You can embed code like this:
-
-```{r}
-1 + 1
-```
-
-You can add options to executable code like this
-
-```{r}
-#| echo: false
-2 * 2
-```
-
-The `echo: false` option disables the printing of code (only output is displayed).
 
 ```{r}
 library(odbc) # provides drivers to connect to different SQL dialects
@@ -50,6 +33,8 @@ con<- dbConnect(odbc::odbc(),
 CREATE EXTENSION IF NOT EXISTS postgis;
 CREATE SCHEMA IF NOT EXISTS data;
 
+-- création d'une table dans la bd pour accueillir les données du json des bixis qui seront manipulables par la suite. On règle les champs pour mimer le contenu du json. (postgres ne prend pas les json comme formats natifs).
+
 DROP TABLE IF EXISTS data.bixi_stations; -- passe pour possibilité de réexécution du code
 
 CREATE TABLE data.bixi_stations (
@@ -64,17 +49,24 @@ CREATE TABLE data.bixi_stations (
     geom         GEOMETRY(Point, 4326)
 );
 
+-- création d'une table temporaire dans la bd pour accueillir les données brutes du json des bixi qui pourront être transférées dans la table crée précédemment (postgres ne prend pas les json comme formats natifs)
+
 DROP TABLE IF EXISTS tmp_bixi;
 
 CREATE TEMP TABLE tmp_bixi (data jsonb);
 ```
 
 ```{r}
+
+# passe en r pout accéder au fichier avec un chemin de client local
+
 bixi_raw <- readr::read_file("U:/projet_final/bixi.json")
 DBI::dbExecute(con, "INSERT INTO tmp_bixi VALUES (?)", list(bixi_raw))
 ```
 
 ```{sql, connection = con}
+
+-- import des données brutes de la table temporaire vers notre vraie table (postgres ne prend pas les json comme formats natifs)
 
 INSERT INTO data.bixi_stations
 SELECT
@@ -86,7 +78,77 @@ SELECT
     ARRAY(SELECT jsonb_array_elements_text(elem->'rental_methods')),
     (elem->>'is_charging')::boolean,
     (elem->>'has_kiosk')::boolean,
-    ST_SetSRID(ST_MakePoint((elem->>'lon')::float, (elem->>'lat')::float), 4326)
+    ST_SetSRID(ST_MakePoint((elem->>'lon')::float, (elem->>'lat')::float), 4326) -- ici dans le json d'origine on as les coordonées lon lat, alors ont utilise ST_MakePoint pour créer la géométrie
 FROM tmp_bixi, jsonb_array_elements(data->'data'->'stations') AS elem ON CONFLICT (station_id) DO NOTHING; -- passe pour possibilité de réexécution du code
+```
+
+```{sql, connection = con}
+
+-- création d'une table dans la bd pour accueillir les données du json du réseau routier qui seront manipulables par la suite. On règle les champs pour mimer le contenu du json. (postgres ne prend pas les json comme formats natifs).
+
+DROP TABLE IF EXISTS data.reseau_routier;
+
+CREATE TABLE data.reseau_routier (
+    id_trc    INTEGER PRIMARY KEY,
+    nom_voie  TEXT,
+    typ_voie  TEXT,
+    odonyme   TEXT,
+    arr_gch   TEXT,
+    arr_drt   TEXT,
+    sens_cir  SMALLINT,
+    classe    SMALLINT,
+    geom      GEOMETRY(LineString, 4326)
+);
+
+-- création d'une table temporaire dans la bd pour accueillir les données brutes du json des bixi qui pourront être transférées dans la table crée précédemment (postgres ne prend pas les json comme formats natifs)
+
+DROP TABLE IF EXISTS tmp_resrout;
+
+CREATE TEMP TABLE tmp_resrout (data jsonb);
+
+```
+
+```{r}
+
+# passe en r pout accéder au fichier avec un chemin de client local
+
+resrout_raw <- readr::read_file("U:/projet_final/reseau_routier.json")
+DBI::dbExecute(con, "INSERT INTO tmp_resrout VALUES (?)", list(resrout_raw))
+```
+
+```{sql, connection = con}
+-- import des données brutes de la table temporaire vers notre vraie table (postgres ne prend pas les json comme formats natifs)
+
+INSERT INTO data.reseau_routier
+SELECT
+    (feat->'properties'->>'ID_TRC')::int,
+    feat->'properties'->>'NOM_VOIE',
+    feat->'properties'->>'TYP_VOIE',
+    feat->'properties'->>'ODONYME',
+    feat->'properties'->>'ARR_GCH',
+    feat->'properties'->>'ARR_DRT',
+    (feat->'properties'->>'SENS_CIR')::smallint,
+    (feat->'properties'->>'CLASSE')::smallint,
+    ST_SetSRID(ST_GeomFromGeoJSON(feat->>'geometry'), 4326) -- ici la table json d'origine a déjà la forme d'un geojson, simple ST_GeomFromGeoJSON pour créer la géométrie 
+FROM tmp_resrout, jsonb_array_elements(data->'features') AS feat ON CONFLICT (id_trc) DO NOTHING;
+
+```
+
+```{sql, connection = con}
+
+SELECT 'bixi_stations' AS table_name, COUNT(*) FROM data.bixi_stations
+UNION ALL
+SELECT 'reseau_routier', COUNT(*) FROM data.reseau_routier;
+```
+
+**Création clé primaire**
+
+```{sql, connection = con}
+
+```
+
+**Création des index spatiaux pour la transformation des données.**
+
+```{sql, connection = con}
 
 ```
