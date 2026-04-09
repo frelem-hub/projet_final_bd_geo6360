@@ -1,6 +1,6 @@
 ---
 title: "merdouille"
-author: "Yaye Aissatou Gueye, Frédéric Lemyre-Corbeil, Robin Durand"
+author: "flc"
 format: html
 editor: visual
 ---
@@ -45,10 +45,12 @@ con<- dbConnect(odbc::odbc(),
 )
 ```
 
-```{sql}
+```{sql, connection = con}
 
 CREATE EXTENSION IF NOT EXISTS postgis;
 CREATE SCHEMA IF NOT EXISTS data;
+
+DROP TABLE IF EXISTS data.bixi_stations; -- passe pour possibilité de réexécution du code
 
 CREATE TABLE data.bixi_stations (
     station_id   TEXT PRIMARY KEY,
@@ -62,9 +64,29 @@ CREATE TABLE data.bixi_stations (
     geom         GEOMETRY(Point, 4326)
 );
 
+DROP TABLE IF EXISTS tmp_bixi;
+
 CREATE TEMP TABLE tmp_bixi (data jsonb);
-COPY tmp_bixi FROM '/chemin/vers/bixi.json';  -- chemin côté serveur PostgreSQL
+```
 
+```{r}
+bixi_raw <- readr::read_file("U:/projet_final/bixi.json")
+DBI::dbExecute(con, "INSERT INTO tmp_bixi VALUES (?)", list(bixi_raw))
+```
 
+```{sql, connection = con}
+
+INSERT INTO data.bixi_stations
+SELECT
+    elem->>'station_id',
+    elem->>'external_id',
+    elem->>'name',
+    elem->>'short_name',
+    (elem->>'capacity')::int,
+    ARRAY(SELECT jsonb_array_elements_text(elem->'rental_methods')),
+    (elem->>'is_charging')::boolean,
+    (elem->>'has_kiosk')::boolean,
+    ST_SetSRID(ST_MakePoint((elem->>'lon')::float, (elem->>'lat')::float), 4326)
+FROM tmp_bixi, jsonb_array_elements(data->'data'->'stations') AS elem ON CONFLICT (station_id) DO NOTHING; -- passe pour possibilité de réexécution du code
 
 ```
