@@ -1,0 +1,70 @@
+---
+title: "merdouille"
+author: "flc"
+format: html
+editor: visual
+---
+
+## Quarto
+
+Quarto enables you to weave together content and executable code into a finished document. To learn more about Quarto see <https://quarto.org>.
+
+## Running Code
+
+When you click the **Render** button a document will be generated that includes both content and the output of embedded code. You can embed code like this:
+
+```{r}
+1 + 1
+```
+
+You can add options to executable code like this
+
+```{r}
+#| echo: false
+2 * 2
+```
+
+The `echo: false` option disables the printing of code (only output is displayed).
+
+```{r}
+library(odbc) # provides drivers to connect to different SQL dialects
+library(DBI)  # provides functions to interact with the database
+library(sf) # Bibliothèque pour l'analyse et traitement des données spatiales
+library(tidyverse) # Data science tools
+library(mapview) # Visu rapide et dynamique des objets spatiaux
+```
+
+```{r}
+
+con<- dbConnect(odbc::odbc(),
+ Driver = "PostgreSQL Unicode",
+ Database = "projet_final",
+ Server = "localhost",
+ UID = "postgres",
+ PWD = "donneeslemig2025" # Ne jamais diffuser un mdp personnel
+)
+```
+
+```{sql}
+
+CREATE EXTENSION IF NOT EXISTS postgis;
+CREATE SCHEMA IF NOT EXISTS data;
+
+CREATE TABLE data.bixi_stations (
+    station_id   TEXT PRIMARY KEY,
+    external_id  TEXT,
+    name         TEXT,
+    short_name   TEXT,
+    capacity     INTEGER,
+    rental_methods TEXT[],
+    is_charging  BOOLEAN,
+    has_kiosk    BOOLEAN,
+    geom         GEOMETRY(Point, 4326)
+);
+
+CREATE TEMP TABLE tmp_bixi (data jsonb);
+COPY tmp_bixi FROM '/chemin/vers/bixi.json';  -- chemin côté serveur PostgreSQL
+
+
+
+```
