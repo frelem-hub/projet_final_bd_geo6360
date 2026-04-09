@@ -1,0 +1,53 @@
+```{r}
+library(osmdata) #  permet d'accéder à l'API overpass
+library(sf) #  spatial
+library(tidyverse) # Langage data scientist
+library(mapview) # carto interactive
+library(odbc)
+library(DBI)
+```
+```{r}
+# Code à exécuter pour passer la sécurité réseau
+curl::has_internet()
+assign("has_internet_via_proxy", TRUE, environment(curl::has_internet))
+curl::has_internet()  # will always be TRUE
+```
+```{r}
+# Requête à l'API overpass
+osm_query <- osmdata::opq(bbox = 'Montreal, Canada' ) %>%
+  osmdata::add_osm_feature(key = "amenity", value = "bar") %>%
+  osmdata::osmdata_sf()
+# Extraction des objets OSM de type points
+bar <- osm_query$osm_points
+# Selection des variables à garder
+bar<- bar%>%
+  dplyr::select(osm_id, name)
+# Observation des données attributaire
+view(bar)
+# Visualisation spatiale des objets
+mapview(bar)
+```
+
+```{r}
+con<- DBI::dbConnect(odbc::odbc(),
+                Driver = "PostgreSQL Unicode",
+                Database = "atelier8",
+                Server = "localhost",
+                port = 5432,
+                UID = "postgres",
+                PWD = "donneeslemig2025",
+)
+```
+
+```{r}
+sf::st_write(obj = bar, 
+         dsn = con, 
+         layer = "bar", 
+         delete_layer = TRUE, # delete_layer = FALSE, ne pas effacer les données si existantes. SI TRUE, les données existantes seront supprimées
+         append = FALSE)  # # append = FALSE, si la couche existe déjà , les nouvelles données la remplaceront. si TRUE, les donnée seront ajoutées aux existantes.
+
+#placer la table dans le schema
+dbExecute(con, "ALTER TABLE public.bar SET SCHEMA spatial_data;")
+```
+
+

@@ -1,0 +1,417 @@
+---
+title: "Atelier 8"
+author: "Thibault Le Corre"
+format: html
+editor: visual
+execute:
+  eval: false
+---
+
+```{r}
+library(odbc) # provides drivers to connect to different SQL dialects
+library(DBI)  # provides functions to interact with the database
+library(sf) # Bibliothèque pour l'analyse et traitement des données spatiales
+library(tidyverse) # Data science tools
+library(mapview) # Visu rapide et dynamique des objets spatiaux
+```
+
+## Connexion à la BD
+
+Connectez vous à votre BD avec le package ODB à partir du code ci-dessous. Création d'un objet de connection 'con'.
+
+```{r}
+
+con<- dbConnect(odbc::odbc(),
+ Driver = "PostgreSQL Unicode",
+ Database = "h26_geo6360_s3",
+ Server = "localhost",
+ UID = "postgres",
+ PWD = "donneeslemig2025" # Ne jamais diffuser un mdp personnel
+)
+```
+
+Une fois la connexion établie, au niveau de `Connections`vous devriez alors pouvoir suivre l'ensemble de l’arborescence de votre BD avec les schémas, les tables, vues, vues matérialisées... vous pouvez également utiliser directement des scripts SQL dans votre Quarto.
+
+**Toutes les opérations de préparation de la BD (schémas, installation des extensions, index spatiaux...) disponibles dans l'atelier 7 doivent être réalisées au préalable.**
+
+## Préparation du réseau (voir atelier 7)
+
+Ici je reproduis les étapes de préparation du réseau de l'atelier 7 sans les commenter.
+
+### Construction du nouveau réseau sur la base des intersections
+
+```{sql, connection = con}
+
+DROP TABLE IF EXISTS analyse_pgrouting.new_reseau;
+
+CREATE TABLE analyse_pgrouting.new_reseau AS
+-- Étape 1 : calcul des points d'intersection
+WITH 
+points_intersection AS (
+SELECT DISTINCT ST_Intersection(a.geom, b.geom) AS geom -- géométrie de l'intersection
+FROM analyse_pgrouting.reseau a
+JOIN analyse_pgrouting.reseau b
+  ON a.id_street < b.id_street -- Evite une double opération redondante
+WHERE ST_Intersects(a.geom, b.geom) -- uniquement là où il y a une intersection effective entre les géométries.
+  AND GeometryType(ST_Intersection(a.geom, b.geom)) = 'POINT'),  -- retient unqiuement les points issus de l'intersection.
+  -- Étape 2 : découpage des lignes par ces points
+decoupage_ligne AS (
+SELECT (ST_Dump(ST_Split(r.geom, pts.geom))).geom AS geom -- je déconstruis mes lignes du réseau de base à chaque rencontre de spoitns d'intersection (géométries uniques ici !) et je les simplifie en simple ligne (dump). Cela suppose que, par la suite, chaque point d'une ligne sera considéré comme le point de départ ou d'arrivée d'un segment. 
+FROM analyse_pgrouting.reseau AS r
+CROSS JOIN (  -- pour chaque ligne du réseau on associe tous les points d'intersection
+    SELECT ST_Union(geom) AS geom  -- on unifie tous les points d'intersection (pour splitter)
+    FROM points_intersection
+) AS pts)
+-- Étape 3 : garder uniquement les LINESTRING et supprimer les doublons
+SELECT DISTINCT geom
+FROM decoupage_ligne
+WHERE GeometryType(geom) = 'LINESTRING';
+```
+
+### Création clé primaire
+
+```{sql, connection = con}
+-- Créer la séquence pour ID incrémental
+DROP SEQUENCE IF EXISTS analyse_pgrouting.street_seq;
+CREATE SEQUENCE analyse_pgrouting.street_seq START 1;
+ALTER TABLE analyse_pgrouting.new_reseau
+ADD COLUMN IF NOT EXISTS id_street BIGINT;
+UPDATE analyse_pgrouting.new_reseau
+SET id_street = nextval('analyse_pgrouting.street_seq');
+```
+
+### Création index spatal
+
+```{sql, connection = con}
+CREATE INDEX IF NOT EXISTS idx_geom_newreseau ON analyse_pgrouting.new_reseau USING gist(geom); -- création de mon objet index sur le réseau 
+```
+
+### Ajout des colonnes nécessaires pour créer topologie réseau
+
+```{sql, connection = con}
+-- Colonne source
+ALTER TABLE analyse_pgrouting.new_reseau DROP COLUMN  IF EXISTS source;
+ALTER TABLE  analyse_pgrouting.new_reseau ADD COLUMN "source" BIGINT;
+
+--Colonnes target
+ALTER TABLE  analyse_pgrouting.new_reseau DROP COLUMN IF EXISTS target;
+ALTER TABLE  analyse_pgrouting.new_reseau ADD COLUMN "target" BIGINT;
+
+-- Ajouter une var sur la longueur de chaque tronçon
+ALTER TABLE  analyse_pgrouting.new_reseau DROP COLUMN IF EXISTS cost;
+ALTER TABLE  analyse_pgrouting.new_reseau ADD COLUMN cost REAL;
+
+UPDATE  analyse_pgrouting.new_reseau 
+SET cost = ST_Length(geom::geography); -- calcul sur l'elliposide en m.
+
+```
+
+### Extraction des sommets
+
+```{sql, connection = con}
+DROP TABLE IF EXISTS analyse_pgrouting.new_reseau_vertices;
+SELECT * INTO analyse_pgrouting.new_reseau_vertices
+FROM pgr_extractVertices(
+    'SELECT id_street AS id, geom FROM analyse_pgrouting.new_reseau'
+    )
+    ;
+
+```
+
+### Création index
+
+```{sql, connection = con}
+CREATE INDEX IF NOT EXISTS idx_geom_newreseau_vectices ON analyse_pgrouting.new_reseau_vertices USING gist(geom); -- création de mon objet index sur le réseau 
+```
+
+### Création de la topologie
+
+Ici j'ai modifié le code par rapport à l'atelier 7 pour une solution plus rapide.
+
+```{sql, connection = con}
+-- Associer arrêtes et noeuds point de départ
+UPDATE analyse_pgrouting.new_reseau AS r
+SET source = v.id
+FROM analyse_pgrouting.new_reseau_vertices AS v
+WHERE ST_DWithin(ST_StartPoint(r.geom), v.geom, 0.000001);
+```
+
+```{sql, connection = con}
+-- Associer arrêtes et noeuds point d'arrivée
+UPDATE analyse_pgrouting.new_reseau AS r
+SET target = v.id
+FROM analyse_pgrouting.new_reseau_vertices AS v
+WHERE ST_DWithin(ST_EndPoint(r.geom), v.geom, 0.000001);
+```
+
+### Préparation de la table des points de départ et arrivée
+
+```{sql, connection = con}
+DROP TABLE IF EXISTS analyse_pgrouting.pt_depart ;
+CREATE TABLE IF NOT EXISTS analyse_pgrouting.pt_depart (
+osm_id BIGINT, address TEXT, geog geography(POINT,4326)
+)
+```
+
+```{sql, connection = con}
+DROP TABLE IF EXISTS analyse_pgrouting.pt_arrivee ;
+CREATE TABLE IF NOT EXISTS analyse_pgrouting.pt_arrivee (
+osm_id BIGINT, address TEXT, geog geography(POINT,4326)
+)
+```
+
+# Géocodage de l'adresse
+
+Le principe ici est de transformer des informations textuelles propres à une adresse postale vers un format géométrique ponctuel localisé dans l'espace en utilisant la bibliothèque de géocodage en r 'tidygeocoder'. Les objets obtenus pourront alors servir de point de départ et d'arrivée pour le calcul du plus court chemin. Cette dernière opération nécessite que chaque point de départ et d'arrivée soit "snappé" au réseau. Comme nous le verrons à la suite du document, c'est cette opération que l'on va automatisée par le déclencheur (trigger)
+
+Le chunck en R ci dessous crée uniquement des objets liés à l'adresse. Pour l'exemple, imaginons que je souhaite partir de l'empire state building et que je souhaite me rendre au siège de l'organisation des nations unies.
+
+```{r}
+adresse_depart <- "20 W 34th street, New York, NY 10001, USA"
+adresse_arrivee <- "405 E 45th street, New York, NY 10017, USA"
+
+```
+
+A partir de ces deux informations textuelles, je mobilise le géocodage de la bibliothèque tidygeocoder qui utilise la base d'adresse de OSM (entre autres). Pour l'exemple j'ajoute le chargement de la librairie ici mais c'est une bonne pratique de l'ajouter en tête du document
+
+```{r}
+library(tidygeocoder)
+# ??tidygeocoder
+
+# Récupération des coordonnées liées à l'adresse avec fonction geo()
+coord_depart<- tidygeocoder::geo(address = adresse_depart, method = "osm", verbose = TRUE, full_results = TRUE)
+  
+# Transformation en objet spatial avec st_as_sf()
+# ?st_as_sf()
+depart_sf <- sf::st_as_sf(coord_depart, coords = c("long", "lat"),crs = 4326)%>%
+  select(osm_id, address, geometry)%>%
+  rename(geog = geometry)
+# mapview(depart_sf) # Check visuel du résultat
+
+# Même chose pour l'adresse d'arrivée
+coord_arrivee<- geo(address = adresse_arrivee, method = "osm", verbose = TRUE, full_results = TRUE)
+arrivee_sf <- sf::st_as_sf(coord_arrivee, coords = c("long", "lat"),crs = 4326) %>%
+  select(osm_id, address, geometry)%>%
+  rename(geog = geometry)
+
+```
+
+# Création des tables qui vont héberger les infos
+
+Il est maintenant temps de crééer les tables et le déclencheur (trigger). Le principe du trigger est d'exécuter une action dès qu'un évènement survient sur la base de données. L'évènement peut notamment être défini selon la nature de modifications de tables et selon le moment (avant ou après des opérations d'ajout, de suppression de lignes...). L'action réalisée par le trigger vise à automatiser une opération lors de l'évènement. Dans notre cas, l'action aura pour objectif de réaliser le "snap" entre le point de départ/arrivée localisé et le point du réseau (noeud) le plus proche et d'ajouter cette information (+ celle de la distance entre ces points)dans des tables dédiés. Cette action s'exécuter dès que l'évènement d'insertion d'une nouvelle ligne dans la table pt_depart et pt_arrivee auront lieu. Par soucis de simplification je sépare la table de départ et d'arrivée (mais on pourrait faire de manière plus parcimonieuse). \### Table de départ
+
+cette table collecte les informations à l'issue de l'exécution du trigger
+
+```{sql connection = con}
+--DROP TABLE IF EXISTS analyse_pgrouting.pt_depart_reseau;
+CREATE TABLE analyse_pgrouting.pt_depart_reseau (
+    id BIGSERIAL PRIMARY KEY, -- big serial permet d'obtenir des valeurs automatiquement attribuées
+    osm_id BIGINT,
+    id_noeud BIGINT,
+    distance DOUBLE PRECISION
+);
+```
+
+### Table d'arrivée
+
+cette table collecte les informations à l'issue de l'exécution du trigger
+
+```{sql connection = con}
+--DROP TABLE IF EXISTS analyse_pgrouting.pt_arrivee_reseau;
+CREATE TABLE analyse_pgrouting.pt_arrivee_reseau (
+    id BIGSERIAL PRIMARY KEY,
+    osm_id BIGINT,
+    id_noeud BIGINT,
+    distance DOUBLE PRECISION
+);
+```
+
+### Réalisation de la fonction du trigger sur table de départ
+
+L'action du trigger renvoie à une fonction qui précise l'opération à exécuter. Ici j'ai simplement repri le code de l'atelier 7 pour identifier le plus proche voisin sur le réseau (avec la table des noeuds) à partir des points initiaux. Comme par définition nous ne connaissons pas par avance les nouveaux objets qui vont s'ajouter aux table pt_depart et pt_arrivee, le terme NEW est appliqué pour en faire référence. Au sein de la fonction nous retrouvons deux parties : INSERT INTO... qui précise que nous allons ajouter des lignes et informations dans les colonnes préccisées et une deuxième à partir de SELECT qui précise les informations à envoyer. Pour le calcul du voisin le plus proche, j'utilise l'opérateur qui est très performant.
+
+```{sql connection = con}
+-- Créer la fonction pour calculer la station de métro la plus proche
+
+CREATE OR REPLACE FUNCTION fct_depart_node_network() 
+RETURNS TRIGGER AS $$
+BEGIN
+    INSERT INTO analyse_pgrouting.pt_depart_reseau (
+        osm_id,
+        id_noeud,
+        distance
+    )
+    SELECT 
+        NEW.osm_id,
+        n.id,
+        ST_Distance(NEW.geog::geography, n.geom::geography)
+    FROM analyse_pgrouting.new_reseau_vertices n
+    ORDER BY NEW.geog::geography <-> n.geom::geography
+    LIMIT 1;
+
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+```
+
+#### Création du tigger sur la table de données
+
+Ici il s'agit de préciser l'évènement, dans sa nature et dans sa temporalité. a partir de AFTER INSERT ON indique que le trigger sera exécuté (EXECUTE FUNCTION) dès qu'il y aura une insertion sur la table précisée et ce pour chaque ligne (EACH ROW).
+
+```{sql connection = con}
+CREATE TRIGGER trg_fct_depart_node_network
+AFTER INSERT ON analyse_pgrouting.pt_depart
+FOR EACH ROW
+EXECUTE FUNCTION fct_depart_node_network();
+```
+
+#### Import du nouveau point dans la base de données
+
+Maintenant que le trigger est défni on peut ajouter notre point de départ à notre table. Dès que ce sera fait le trigger s'exécutera et vous aurez une automatisation totale du geotaggage entre le point initial et le noeud le plus proche sur le réseau.
+
+```{r}
+# Insertion des valeurs dans table dans un schéma précis
+dbWriteTable(
+  conn = con,
+  name = Id(schema = "analyse_pgrouting", table = "pt_depart"),  # schéma + table
+  value = depart_sf,
+  append = TRUE,
+  row.names = FALSE
+)
+
+```
+
+### Réalisation de la fonction du trigger sur table d'arrivée
+
+Même principe que sur la table de départ. Essayez de commenter votre code.
+
+```{sql connection = con}
+
+
+CREATE OR REPLACE FUNCTION fct_arrivee_node_network() 
+RETURNS TRIGGER AS $$
+BEGIN
+    INSERT INTO analyse_pgrouting.pt_arrivee_reseau (
+        osm_id,
+        id_noeud,
+        distance
+    )
+    SELECT 
+        NEW.osm_id,
+        n.id,
+        ST_Distance(NEW.geog::geography, n.geom::geography)
+    FROM analyse_pgrouting.new_reseau_vertices n
+    ORDER BY NEW.geog::geography <-> n.geom::geography
+    LIMIT 1;
+
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+```
+
+#### Création du tigger sur la table de données
+
+```{sql connection = con}
+CREATE TRIGGER trg_fct_arrivee_node_network
+AFTER INSERT ON analyse_pgrouting.pt_arrivee
+FOR EACH ROW
+EXECUTE FUNCTION fct_arrivee_node_network();
+```
+
+#### Import du nouveau point dans la base de données
+
+```{r}
+# Insertion des valeurs dans table dans un schéma précis
+dbWriteTable(
+  conn = con,
+  name = Id(schema = "analyse_pgrouting", table = "pt_arrivee"),  # schéma + table
+  value = arrivee_sf,
+  append = TRUE,
+  row.names = FALSE
+)
+
+```
+
+### Calcul plus court chemin
+
+On calcule maintenant le plus court chemin. Je précise de réaliser l'algortihme à partir du dernier ajout sur la table (relatif au numéro de l'identifiant le plus élevé.)
+
+```{sql, connection = con}
+
+DROP TABLE IF EXISTS analyse_pgrouting.new_shpath2;
+CREATE TABLE analyse_pgrouting.new_shpath2 AS
+SELECT * 
+FROM pgr_dijkstra(
+    'SELECT id_street AS id, source::INT4, target::INT4, cost FROM analyse_pgrouting.new_reseau
+     WHERE source IS NOT NULL
+      AND target IS NOT NULL'::text,
+      (SELECT id_noeud  FROM analyse_pgrouting.pt_depart_reseau
+     ORDER BY id_noeud DESC LIMIT 1), -- noeud de départ
+      (SELECT id_noeud  FROM analyse_pgrouting.pt_arrivee_reseau
+      ORDER BY id_noeud DESC LIMIT 1),   -- noeud d'arrivée
+   false -- non dirigé
+);
+```
+
+### Jointure avec le reste du réseau
+
+On peut joindre la table des résultats avec la géométrie du réseau pour une visualisation.
+
+```{sql, connection = con}
+
+DROP TABLE IF EXISTS analyse_pgrouting.new_shpath2_geom;
+
+CREATE TABLE analyse_pgrouting.new_shpath2_geom AS
+SELECT   sp.seq,            -- séquence du chemin
+    sp.node,           -- noeud actuel
+    sp.edge,           -- id de l’arête
+    sp.cost,           -- coût de l’arête
+    r.id_street,       -- id de la rue
+    r.geom,            -- géométrie de la rue
+    r.source,
+    r.target
+FROM analyse_pgrouting.new_shpath2 AS sp
+LEFT JOIN analyse_pgrouting.new_reseau AS r
+    ON sp.edge = r.id_street;
+```
+
+### Visualisation
+
+Pour la visualisation, on revient sur une environnement de programmation en R. Il y a beaucoup de possibilités de visualisations possibles des objets spatiaux en R. Pour la plupart on doit importer les objets de la BD dans l'environnement de travail en R.
+
+```{r}
+
+new_shpath2_sf <- st_read(con, 
+query = "SELECT * 
+   FROM analyse_pgrouting.new_shpath2_geom
+")
+
+# Visu basique
+plot(new_shpath2_sf$geom)
+# Visu interactive
+mapview(new_shpath2_sf)
+```
+
+### Comparaison avec une bibliothèque R dédiée
+
+Ici je teste mon résultat final avec une biliothèque R qui devrait réaliser exactement ce que fais tout notre code en... une seule ligne. C'est tout le principe des fonctions des biliothèques (packages, extensions, librairies, paquets...), elles permettent de réaliser simplement des opérations en ajoutant des arguments à une fonctions, mais derrière le code qui construit et paramètre la fonction peut être complexe et très long. Je mobilise ici le package '[osrm](https://github.com/riatelab/osrm)'.
+
+```{r}
+# install.packages("osrm")
+library(osrm)
+# On réutilise les objets sf des points de départ et d'arrivée du début du document
+route_osrm <- osrmRoute(src = depart_sf, dst = arrivee_sf)
+mapview(route_osrm) # Visu seule
+mapview(route_osrm) + mapview(new_shpath2_sf) # Comparaison visuelle
+```
+
+Les résultats ne sont pas égaux, pas étonnant car malgré des données issues du même producteur (osm), elles en sont pas similaires en tous points. Les notres sont tirées du livrable du livre en ligne 'Introduction to postgis', mais aussi on a reconstruit le réseau de nôtre côté, il n'est pas mis à jour de manière dynamique.... Par ailleurs il y a certainement des différences avec le calcul : pour estimer le plus court chemin on n'a par exemple pas mis de contraintes sur les qualités du réseau (vitesse, direction....), les moyens de transport... Il est fort probable que les procédés des auteur.es de la librairie 'osrm' ont réalisé d'autres choix. La confrontation avec la réalité permettrait de valider telle ou telle méthode. Mais comme nous ne sommes pas à New-York on peut déjà comparer le coût total des deux itinéraires.
+
+```{r}
+summary(route_osrm) # 2035 m pour l'itinéraire proposé par osrm
+sum(new_shpath2_sf$cost) # 1932 m pour l'itinéraire proposé par notre méthode. Mais attention, nous sommes respectivement à 67 et 70m de nos points de départ et d'arrivée sur le réseau. Donc 1932 +  137 = 2069. 
+```
+
+Par notre méthode on observe donc que l'itinéraire que l'on propose est sensiblement plus long que celui proposé par la fonction de routage du package 'osrm'. Mais personnellement je trouve notre itinéraire bien plus séduisant et c'est certainement celui que j'emprunterais si j'étais un utilisateur d'une application de navigation :).
+
+A vous de reprendre le code en changeant les lieux de départ et d'arrivée. Bien sûr comme notre réseau est limitée à l'étendue de NY, à vous d'identifier les lieux d'origine et de destination au sein de cette emprise.
