@@ -1,5 +1,5 @@
 ---
-title: "merdouille"
+title: "tp_final"
 author: "Yaye Aissatou Gueye, Frédéric Lemyre-Corbeil, Robin Durand"
 format: html
 editor: visual
