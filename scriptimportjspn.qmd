@@ -136,19 +136,173 @@ FROM tmp_resrout, jsonb_array_elements(data->'features') AS feat ON CONFLICT (id
 
 ```{sql, connection = con}
 
+-- vérification que nos tables sont bien peuplées
+
 SELECT 'bixi_stations' AS table_name, COUNT(*) FROM data.bixi_stations
 UNION ALL
 SELECT 'reseau_routier', COUNT(*) FROM data.reseau_routier;
 ```
 
-**Création clé primaire**
+**Création des index spatiaux (data) pour la transformation des données.**
 
 ```{sql, connection = con}
+
+CREATE INDEX ON data.bixi_stations  USING GIST (geom);
+CREATE INDEX ON data.reseau_routier USING GIST (geom);
+```
+
+**Création d'un nouveau schéma pgrouting pour l'analyse**
+
+```{sql, connection = con}
+
+--installation de pgrouting
+CREATE EXTENSION IF NOT EXISTS pgrouting;
+
+-- création du schéma dédié
+CREATE SCHEMA IF NOT EXISTS analyse_pgrouting;
+
+-- gestion des chemins d'accès
+SET search_path = analyse_pgrouting, data, public;
+```
+
+**Import du réseau dans le schéma pgrouting**
+
+```{sql, connection = con}
+-- Transformer les MULTILINESTRING en LINESTRING
+DROP TABLE IF EXISTS analyse_pgrouting.new_reseau;
+
+CREATE TABLE analyse_pgrouting.new_reseau AS
+SELECT id_trc::BIGINT,
+    (ST_Dump(geom)).geom AS geom
+FROM data.reseau_routier;
+
+DROP TABLE IF EXISTS analyse_pgrouting.reseau;
+
+CREATE TABLE analyse_pgrouting.reseau AS
+SELECT id_trc::BIGINT,
+    (ST_Dump(geom)).geom AS geom
+FROM data.reseau_routier;
+```
+
+Création du réseau sur la base des intersection
+
+```{sql, connection = con}
+
+DROP TABLE IF EXISTS analyse_pgrouting.new_reseau;
+
+CREATE TABLE analyse_pgrouting.new_reseau AS
+-- Étape 1 : calcul des points d'intersection
+WITH 
+points_intersection AS (
+SELECT DISTINCT ST_Intersection(a.geom, b.geom) AS geom -- géométrie de l'intersection
+FROM analyse_pgrouting.reseau a
+JOIN analyse_pgrouting.reseau b
+  ON a.id_trc < b.id_trc -- Evite une double opération redondante
+WHERE ST_Intersects(a.geom, b.geom) -- uniquement là où il y a une intersection effective entre les géométries.
+  AND GeometryType(ST_Intersection(a.geom, b.geom)) = 'POINT'),  -- retient unqiuement les points issus de l'intersection.
+  -- Étape 2 : découpage des lignes par ces points
+decoupage_ligne AS (
+SELECT (ST_Dump(ST_Split(r.geom, pts.geom))).geom AS geom -- je déconstruis mes lignes du réseau de base à chaque rencontre de spoitns d'intersection (géométries uniques ici !) et je les simplifie en simple ligne (dump). Cela suppose que, par la suite, chaque point d'une ligne sera considéré comme le point de départ ou d'arrivée d'un segment. 
+FROM analyse_pgrouting.reseau AS r
+CROSS JOIN (  -- pour chaque ligne du réseau on associe tous les points d'intersection
+    SELECT ST_Union(geom) AS geom  -- on unifie tous les points d'intersection (pour splitter)
+    FROM points_intersection
+) AS pts)
+-- Étape 3 : garder uniquement les LINESTRING et supprimer les doublons
+SELECT DISTINCT geom
+FROM decoupage_ligne
+WHERE GeometryType(geom) = 'LINESTRING';
 
 ```
 
-**Création des index spatiaux pour la transformation des données.**
+**Création clé primaire**
 
 ```{sql, connection = con}
+-- Créer la séquence pour ID incrémental
+DROP SEQUENCE IF EXISTS analyse_pgrouting.street_seq;
+CREATE SEQUENCE analyse_pgrouting.street_seq START 1;
+ALTER TABLE analyse_pgrouting.new_reseau
+ADD COLUMN IF NOT EXISTS id_trc BIGINT;
+UPDATE analyse_pgrouting.new_reseau
+SET id_trc = nextval('analyse_pgrouting.street_seq');
+```
 
+**Création d'index spatiaux (pgrouting)**
+
+```{sql, connection = con}
+CREATE INDEX IF NOT EXISTS idx_geom_newreseau ON analyse_pgrouting.new_reseau USING gist(geom); -- création de mon objet index sur le réseau  
+```
+
+**Ajout des colonnes pour créer la topologie**
+
+```{sql, connection = con}
+-- Colonne source
+ALTER TABLE analyse_pgrouting.new_reseau DROP COLUMN  IF EXISTS source;
+ALTER TABLE  analyse_pgrouting.new_reseau ADD COLUMN "source" BIGINT;
+
+--Colonnes target
+ALTER TABLE  analyse_pgrouting.new_reseau DROP COLUMN IF EXISTS target;
+ALTER TABLE  analyse_pgrouting.new_reseau ADD COLUMN "target" BIGINT;
+
+-- Ajouter une var sur la longueur de chaque tronçon
+ALTER TABLE  analyse_pgrouting.new_reseau DROP COLUMN IF EXISTS cost;
+ALTER TABLE  analyse_pgrouting.new_reseau ADD COLUMN cost REAL;
+
+UPDATE  analyse_pgrouting.new_reseau 
+SET cost = ST_Length(geom::geography); -- calcul sur l'elliposide en m.
+
+```
+
+### Extraction des sommets
+
+```{sql, connection = con}
+DROP TABLE IF EXISTS analyse_pgrouting.new_reseau_vertices;
+SELECT * INTO analyse_pgrouting.new_reseau_vertices
+FROM pgr_extractVertices(
+    'SELECT id_trc AS id, geom FROM analyse_pgrouting.new_reseau'
+    )
+    ;
+
+```
+
+### Création index
+
+```{sql, connection = con}
+CREATE INDEX IF NOT EXISTS idx_geom_newreseau_vertices ON analyse_pgrouting.new_reseau_vertices USING gist(geom); -- création de mon objet index sur le réseau 
+```
+
+### Création de la topologie
+
+Ici j'ai modifié le code par rapport à l'atelier 7 pour une solution plus rapide.
+
+```{sql, connection = con}
+-- Associer arrêtes et noeuds point de départ
+UPDATE analyse_pgrouting.new_reseau AS r
+SET source = v.id
+FROM analyse_pgrouting.new_reseau_vertices AS v
+WHERE ST_DWithin(ST_StartPoint(r.geom), v.geom, 0.000001);
+```
+
+```{sql, connection = con}
+-- Associer arrêtes et noeuds point d'arrivée
+UPDATE analyse_pgrouting.new_reseau AS r
+SET target = v.id
+FROM analyse_pgrouting.new_reseau_vertices AS v
+WHERE ST_DWithin(ST_EndPoint(r.geom), v.geom, 0.000001);
+```
+
+### Préparation de la table des points de départ et arrivée
+
+```{sql, connection = con}
+DROP TABLE IF EXISTS analyse_pgrouting.pt_depart ;
+CREATE TABLE IF NOT EXISTS analyse_pgrouting.pt_depart (
+osm_id BIGINT, address TEXT, geog geography(POINT,4326)
+)
+```
+
+```{sql, connection = con}
+DROP TABLE IF EXISTS analyse_pgrouting.pt_arrivee ;
+CREATE TABLE IF NOT EXISTS analyse_pgrouting.pt_arrivee (
+osm_id BIGINT, address TEXT, geog geography(POINT,4326)
+)
 ```
