@@ -1,0 +1,100 @@
+---
+title: "Projet_Session_GEO6360_H26"
+author: "Aissatou Frederic Robin"
+format: html
+editor: visual
+---
+
+# Ajout des bibliotheques nécessaires
+
+```{r}
+library(odbc) # provides drivers to connect to different SQL dialects
+library(DBI)  # provides functions to interact with the database
+library(sf) # Bibliothèque pour l'analyse et traitement des données spatiales
+library(tidyverse) # Data science tools
+library(mapview) # Visu rapide et dynamique des objets spatiaux
+```
+
+# Création de la BD et installation de l'extension PostGIS
+
+Ici on a crée une base de données qu'on a nommé "projet_final" avec un schéma "data" puis installé l'extention Postgis dans l'interface pgAdmin via un code sql :
+
+CREATE DATABASE projet_final
+
+    WITH
+
+    OWNER = postgres
+
+    ENCODING = 'UTF8'
+
+    LOCALE_PROVIDER = 'libc'
+
+    CONNECTION LIMIT = -1
+
+    IS_TEMPLATE = False;
+
+CREATE EXTENSION IF NOT EXISTS postgis;
+
+CREATE SCHEMA IF NOT EXISTS data;
+
+# Connexion à la BD
+
+```{r}
+con<- dbConnect(odbc::odbc(),
+ Driver = "PostgreSQL Unicode",
+ Database = "atelier8",
+ Server = "localhost",
+ UID = "postgres",
+ PWD = "donneeslemig2025" # Ne jamais diffuser un mdp personnel
+)
+```
+
+# Création index spatial
+
+# Création clé primaire
+
+# Collecte des données
+
+### **Stations BIXI**
+
+Nous avons dans cette partie les données contenant la liste des stations bixi recupérés depuis l'API officielle de vélo BIXI Montréal, qui fournit en temps réel la localisation et les caractéristiques de chaque station.
+
+### **Réseau routier**
+
+Le réseau cyclable est extrait ici dans les données ouvertes de Montréal.
+
+Ces deux jeux de données ont été téléchargées via le portail des données ouvertes de Montréal car on le trouve beaucoup plus proche de la réalité comparées aux données d'OSM qui sont plus formulées par des utilisateurs.
+
+# Transformation
+
+### Connectivité des noeuds
+
+### Projection
+
+Ici les couches sont reprojetées dans un systeme de coordonnée adaptée à Montréal.
+
+### Uniformisation des données
+
+### Sélection des attributs
+
+# Stockage
+
+### Stockage des tables dans PostGIS
+
+Les objets sont sauvegardés localement. Cela évite de devoir re_télécharger et de recalculer les données à chaque exécution du document.
+
+# **Analyses**
+
+### Géocodage
+
+Cette opération va permettre de convertir une adresse textuelle en coordonnées géographiques. Il nous permettra d'entrer une adresse de départ et ue adresse d'arrrivée, qui seront ensuite converties en points sur la carte.
+
+### Geotagging
+
+### Calcul du chemin de navigation
+
+L'algorithme de ... est appliqué ici pour calculer le chemin le plus optimal entre deux noeuds du graphe, Il explore progressivement le réseau en partant d'un noeud de départ.
+
+### Visualisation
+
+Les résultats sont présentés ici sous forme de graphe interactive. Il permet l'utilisateur de zoomer, dde cliquer sur les stations et de comparer visuellement les itinéraires.
