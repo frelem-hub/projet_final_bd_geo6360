@@ -1,7 +1,3 @@
-```{sql connection=}
-
-```
-
 ---
 title: "merdouille"
 author: "flc"
@@ -15,13 +11,15 @@ library(DBI)  # provides functions to interact with the database
 library(sf) # Bibliothèque pour l'analyse et traitement des données spatiales
 library(tidyverse) # Data science tools
 library(mapview) # Visu rapide et dynamique des objets spatiaux
+library(tidygeocoder)
+library(osrm)
 ```
 
 ```{r}
 
 con<- dbConnect(odbc::odbc(),
  Driver = "PostgreSQL Unicode",
- Database = "projet_final",
+ Database = "projet_final_test4avril",
  Server = "localhost",
  UID = "postgres",
  PWD = "donneeslemig2025" # Ne jamais diffuser un mdp personnel
@@ -29,6 +27,8 @@ con<- dbConnect(odbc::odbc(),
 ```
 
 ```{sql, connection = con}
+
+-- installation de l'extension postgis pour la gestion des géometries et d'un schéma data pour accueillir nos données brutes
 
 CREATE EXTENSION IF NOT EXISTS postgis;
 CREATE SCHEMA IF NOT EXISTS data;
@@ -58,10 +58,14 @@ CREATE TEMP TABLE tmp_bixi (data jsonb);
 
 ```{r}
 
-# passe en r pout accéder au fichier avec un chemin de client local
+# passe en r pour accéder au fichier directement sur internet
 
-bixi_raw <- readr::read_file("U:/projet_final/bixi.json")
+bixi_raw <- readr::read_file("https://gbfs.velobixi.com/gbfs/fr/station_information.json")
 DBI::dbExecute(con, "INSERT INTO tmp_bixi VALUES (?)", list(bixi_raw))
+
+# SI LE LIEN EST BRISÉ, simplement spécifier un chemin vers le fichier en local
+#bixi_raw <- readr::read_file("U:\projet_final\bixi.json") # EXEMPLE
+#DBI::dbExecute(con, "INSERT INTO tmp_bixi VALUES (?)", list(bixi_raw))
 ```
 
 ```{sql, connection = con}
@@ -112,8 +116,12 @@ CREATE TEMP TABLE tmp_resrout (data jsonb);
 
 # passe en r pout accéder au fichier avec un chemin de client local
 
-resrout_raw <- readr::read_file("U:/projet_final/reseau_routier.json")
+resrout_raw <- readr::read_file("https://urls.fr/6e0Uog") #lien réduit parce que l'original est trop long
 DBI::dbExecute(con, "INSERT INTO tmp_resrout VALUES (?)", list(resrout_raw))
+
+# SI LE LIEN EST BRISÉ, simplement spécifier un chemin vers le fichier en local
+#resrout_raw <- readr::read_file("U:\projet_final\reseau_routier.json) # EXEMPLE
+#DBI::dbExecute(con, "INSERT INTO tmp_resrout VALUES (?)", list(resrout_raw))
 ```
 
 ```{sql, connection = con}
@@ -306,3 +314,252 @@ CREATE TABLE IF NOT EXISTS analyse_pgrouting.pt_arrivee (
 osm_id BIGINT, address TEXT, geog geography(POINT,4326)
 )
 ```
+
+## **Préparation du Géocodage**
+
+```{r}
+adresse_depart <- "3029 Boulevard Édouard Montpetit, Montréal, Québec, H3T 1S1, Canada"
+adresse_arrivee <- "1375 Avenue Thérèse-Lavoie-Roux, Montréal, Québec, H2V 0B3, Canada"
+```
+
+```{r}
+# ??tidygeocoder
+
+# Récupération des coordonnées liées à l'adresse avec fonction geo()
+coord_depart<- tidygeocoder::geo(address = adresse_depart, method = "osm", verbose = TRUE, full_results = TRUE)
+  
+# Transformation en objet spatial avec st_as_sf()
+# ?st_as_sf()
+depart_sf <- sf::st_as_sf(coord_depart, coords = c("long", "lat"),crs = 4326)%>%
+  select(osm_id, address, geometry)%>%
+  rename(geog = geometry)
+# mapview(depart_sf) # Check visuel du résultat
+
+# Même chose pour l'adresse d'arrivée
+coord_arrivee<- geo(address = adresse_arrivee, method = "osm", verbose = TRUE, full_results = TRUE)
+arrivee_sf <- sf::st_as_sf(coord_arrivee, coords = c("long", "lat"),crs = 4326) %>%
+  select(osm_id, address, geometry)%>%
+  rename(geog = geometry)
+```
+
+## Création des tables Hébergeantes pour l'opération trigger
+
+```{sql connection = con}
+
+-- Création d'une table de départ sur les noeuds du réseau
+
+DROP TABLE IF EXISTS analyse_pgrouting.pt_depart_reseau;
+
+CREATE TABLE analyse_pgrouting.pt_depart_reseau (
+    id BIGSERIAL PRIMARY KEY, -- big serial permet d'obtenir des valeurs automatiquement attribuées
+    osm_id BIGINT,
+    id_noeud BIGINT,
+    distance DOUBLE PRECISION
+);
+```
+
+```{sql connection = con}
+
+-- Création d'une table d'arrivée sur les noeuds du réseau
+
+DROP TABLE IF EXISTS analyse_pgrouting.pt_arrivee_reseau;
+
+CREATE TABLE analyse_pgrouting.pt_arrivee_reseau (
+    id BIGSERIAL PRIMARY KEY,
+    osm_id BIGINT,
+    id_noeud BIGINT,
+    distance DOUBLE PRECISION
+);
+```
+
+### Fonction trigger
+
+```{sql connection = con}
+
+-- Créer la fonction pour calculer la station de bixi la plus proche
+
+CREATE OR REPLACE FUNCTION fct_depart_node_network() 
+RETURNS TRIGGER AS $$
+BEGIN
+    INSERT INTO analyse_pgrouting.pt_depart_reseau (
+        osm_id, 
+        id_noeud,
+        distance
+    )
+    SELECT 
+        NEW.osm_id,
+        n.id,
+        ST_Distance(NEW.geog::geography, n.geom::geography)
+    FROM analyse_pgrouting.new_reseau_vertices n
+    ORDER BY NEW.geog::geography <-> n.geom::geography
+    LIMIT 1;
+
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+```
+
+#### Création du tigger sur la table de données
+
+Ici il s'agit de préciser l'évènement, dans sa nature et dans sa temporalité. a partir de AFTER INSERT ON indique que le trigger sera exécuté (EXECUTE FUNCTION) dès qu'il y aura une insertion sur la table précisée et ce pour chaque ligne (EACH ROW).
+
+```{sql connection = con}
+
+DROP TRIGGER IF EXISTS trg_fct_depart_node_network ON analyse_pgrouting.pt_depart;
+
+CREATE TRIGGER trg_fct_depart_node_network
+AFTER INSERT ON analyse_pgrouting.pt_depart 
+FOR EACH ROW
+EXECUTE FUNCTION fct_depart_node_network();
+```
+
+#### Import du nouveau point dans la base de données
+
+Maintenant que le trigger est défni on peut ajouter notre point de départ à notre table. Dès que ce sera fait le trigger s'exécutera et vous aurez une automatisation totale du geotaggage entre le point initial et le noeud le plus proche sur le réseau.
+
+```{r}
+# Insertion des valeurs dans table dans un schéma précis
+dbWriteTable(
+  conn = con,
+  name = Id(schema = "analyse_pgrouting", table = "pt_depart"),  # schéma + table
+  value = depart_sf,
+  append = TRUE,
+  row.names = FALSE
+)
+
+```
+
+### Réalisation de la fonction du trigger sur table d'arrivée
+
+Même principe que sur la table de départ. Essayez de commenter votre code.
+
+```{sql connection = con}
+
+CREATE OR REPLACE FUNCTION fct_arrivee_node_network() 
+RETURNS TRIGGER AS $$
+BEGIN
+    INSERT INTO analyse_pgrouting.pt_arrivee_reseau (
+        osm_id,
+        id_noeud,
+        distance
+    )
+    SELECT 
+        NEW.osm_id,
+        n.id,
+        ST_Distance(NEW.geog::geography, n.geom::geography)
+    FROM analyse_pgrouting.new_reseau_vertices n
+    ORDER BY NEW.geog::geography <-> n.geom::geography
+    LIMIT 1;
+
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+```
+
+#### Création du tigger sur la table de données
+
+```{sql connection = con}
+
+DROP TRIGGER IF EXISTS trg_fct_arrivee_node_network ON analyse_pgrouting.pt_arrive;
+
+CREATE TRIGGER trg_fct_arrivee_node_network
+AFTER INSERT ON analyse_pgrouting.pt_arrivee
+FOR EACH ROW
+EXECUTE FUNCTION fct_arrivee_node_network();
+```
+
+#### Import du nouveau point dans la base de données
+
+```{r}
+# Insertion des valeurs dans table dans un schéma précis
+dbWriteTable(
+  conn = con,
+  name = Id(schema = "analyse_pgrouting", table = "pt_arrivee"),  # schéma + table
+  value = arrivee_sf,
+  append = TRUE,
+  row.names = FALSE
+)
+
+```
+
+### Calcul plus court chemin
+
+On calcule maintenant le plus court chemin. Je précise de réaliser l'algortihme à partir du dernier ajout sur la table (relatif au numéro de l'identifiant le plus élevé.)
+
+```{sql, connection = con}
+
+DROP TABLE IF EXISTS analyse_pgrouting.new_shpath2;
+CREATE TABLE analyse_pgrouting.new_shpath2 AS
+SELECT * 
+FROM pgr_dijkstra(
+    'SELECT id_trc AS id, source::INT4, target::INT4, cost FROM analyse_pgrouting.new_reseau
+     WHERE source IS NOT NULL
+      AND target IS NOT NULL'::text,
+      (SELECT id_noeud  FROM analyse_pgrouting.pt_depart_reseau
+     ORDER BY id_noeud DESC LIMIT 1), -- noeud de départ
+      (SELECT id_noeud  FROM analyse_pgrouting.pt_arrivee_reseau
+      ORDER BY id_noeud DESC LIMIT 1),   -- noeud d'arrivée
+   false -- non dirigé
+);
+```
+
+### Jointure avec le reste du réseau
+
+On peut joindre la table des résultats avec la géométrie du réseau pour une visualisation.
+
+```{sql, connection = con}
+
+DROP TABLE IF EXISTS analyse_pgrouting.new_shpath2_geom;
+
+CREATE TABLE analyse_pgrouting.new_shpath2_geom AS
+SELECT   sp.seq,            -- séquence du chemin
+    sp.node,           -- noeud actuel
+    sp.edge,           -- id de l’arête
+    sp.cost,           -- coût de l’arête
+    r.id_trc,       -- id de la rue
+    r.geom,            -- géométrie de la rue
+    r.source,
+    r.target
+FROM analyse_pgrouting.new_shpath2 AS sp
+LEFT JOIN analyse_pgrouting.new_reseau AS r
+    ON sp.edge = r.id_trc;
+```
+
+### Visualisation
+
+Pour la visualisation, on revient sur une environnement de programmation en R. Il y a beaucoup de possibilités de visualisations possibles des objets spatiaux en R. Pour la plupart on doit importer les objets de la BD dans l'environnement de travail en R.
+
+```{r}
+
+new_shpath2_sf <- st_read(con, 
+query = "SELECT * 
+   FROM analyse_pgrouting.new_shpath2_geom
+")
+
+# Visu basique
+plot(new_shpath2_sf$geom)
+# Visu interactive
+mapview(new_shpath2_sf)
+```
+
+### Comparaison avec une bibliothèque R dédiée
+
+Ici je teste mon résultat final avec une biliothèque R qui devrait réaliser exactement ce que fais tout notre code en... une seule ligne. C'est tout le principe des fonctions des biliothèques (packages, extensions, librairies, paquets...), elles permettent de réaliser simplement des opérations en ajoutant des arguments à une fonctions, mais derrière le code qui construit et paramètre la fonction peut être complexe et très long. Je mobilise ici le package '[osrm](https://github.com/riatelab/osrm)'.
+
+```{r}
+# On réutilise les objets sf des points de départ et d'arrivée du début du document
+route_osrm <- osrmRoute(src = depart_sf, dst = arrivee_sf)
+mapview(route_osrm) # Visu seule
+mapview(route_osrm) + mapview(new_shpath2_sf) # Comparaison visuelle
+```
+
+Les résultats ne sont pas égaux, pas étonnant car malgré des données issues du même producteur (osm), elles en sont pas similaires en tous points. Les notres sont tirées du livrable du livre en ligne 'Introduction to postgis', mais aussi on a reconstruit le réseau de nôtre côté, il n'est pas mis à jour de manière dynamique.... Par ailleurs il y a certainement des différences avec le calcul : pour estimer le plus court chemin on n'a par exemple pas mis de contraintes sur les qualités du réseau (vitesse, direction....), les moyens de transport... Il est fort probable que les procédés des auteur.es de la librairie 'osrm' ont réalisé d'autres choix. La confrontation avec la réalité permettrait de valider telle ou telle méthode. Mais comme nous ne sommes pas à New-York on peut déjà comparer le coût total des deux itinéraires.
+
+```{r}
+summary(route_osrm) # 2035 m pour l'itinéraire proposé par osrm
+sum(new_shpath2_sf$cost) # 1932 m pour l'itinéraire proposé par notre méthode. Mais attention, nous sommes respectivement à 67 et 70m de nos points de départ et d'arrivée sur le réseau. Donc 1932 +  137 = 2069. 
+```
+
+Par notre méthode on observe donc que l'itinéraire que l'on propose est sensiblement plus long que celui proposé par la fonction de routage du package 'osrm'. Mais personnellement je trouve notre itinéraire bien plus séduisant et c'est certainement celui que j'emprunterais si j'étais un utilisateur d'une application de navigation :).
+
+A vous de reprendre le code en changeant les lieux de départ et d'arrivée. Bien sûr comme notre réseau est limitée à l'étendue de NY, à vous d'identifier les lieux d'origine et de destination au sein de cette emprise.
