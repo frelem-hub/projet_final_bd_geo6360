@@ -82,8 +82,9 @@ bixi_raw <- readr::read_file("https://gbfs.velobixi.com/gbfs/fr/station_informat
 
 DBI::dbExecute(con, "INSERT INTO tmp_bixi VALUES (?)", list(bixi_raw))
 
-# SI LE LIEN EST BRISÉ, simplement spécifier un chemin vers le fichier en local
-#bixi_raw <- readr::read_file("U:\projet_final\bixi.json") # EXEMPLE
+# SI LE LIEN INTERNET EST BRISÉ, simplement spécifier un chemin vers le fichier en local, commentariser le bloc du haut et décomentariser les bloc du bas
+
+#bixi_raw <- readr::read_file("U:\projet_final\bixi.json") # EXEMPLE, le fichier sera dans le fichier source à l'endroit de téléchargement
 #DBI::dbExecute(con, "INSERT INTO tmp_bixi VALUES (?)", list(bixi_raw))
 ```
 
@@ -133,14 +134,15 @@ CREATE TEMP TABLE tmp_resrout (data jsonb);
 
 ```{r}
 
-# passe en r pout accéder au fichier avec un chemin de client local
+# passe en r pout accéder au fichier avec un lien internet direct
 
-resrout_raw <- readr::read_file("https://montreal-prod.storage.googleapis.com/resources/9d3d60d8-4e7f-493e-8d6a-dcd040319d8d/geobase.json")
+resrout_raw <- readr::read_file("https://montreal-prod.storage.googleapis.com/resources/9d3d60d8-4e7f-493e-8d6a-dcd040319d8d/geobase.json?X-Goog-Algorithm=GOOG4-RSA-SHA256&X-Goog-Credential=test-datapusher-delete%40amplus-data.iam.gserviceaccount.com%2F20260416%2Fauto%2Fstorage%2Fgoog4_request&X-Goog-Date=20260416T144200Z&X-Goog-Expires=604800&X-Goog-SignedHeaders=host&x-goog-signature=28e85ed07d730c60c0dc4aced7006636096f233be477195ad39ed1ffa93e4136d1ba66f488c7534224af01dde6d5023b46b42b7df23f338b5e1dfd91f3a2271eec559d537781c76a7c035bc95e466dc423eed531129bb6611435d48b320456805e2a111b65f53e17e9f0d234b200d0dc1f99f55474280c5f40c64b1a16e7d9d4a6622659fdc74a64f482de3645877d1357339176aeb0bb1436b565678f855e7c635090134d38c477b5b50eb1aeeb92fd2ddd67bb041d0beaaf9ee4e42140a55a067d6a8563f0504305dcf6c9972bb634315a6b39f16815597d8d4fcff010960f41fecd285345000525ba1df26b5c5891dab66d1538f5353068efacfe10072c4e")
 
 DBI::dbExecute(con, "INSERT INTO tmp_resrout VALUES (?)", list(resrout_raw))
 
-# SI LE LIEN EST BRISÉ, simplement spécifier un chemin vers le fichier en local
-#resrout_raw <- readr::read_file("U:\projet_final\reseau_routier.json) # EXEMPLE
+# SI LE LIEN INTERNET EST BRISÉ, simplement spécifier un chemin vers le fichier en local, commentariser le bloc du haut et décomentariser les bloc du bas
+
+#resrout_raw <- readr::read_file("U:\projet_final\reseau_routier.json) # EXEMPLE, le fichier sera dans le fichier source à l'endroit de téléchargement
 #DBI::dbExecute(con, "INSERT INTO tmp_resrout VALUES (?)", list(resrout_raw))
 ```
 
@@ -212,7 +214,7 @@ SELECT id_trc::BIGINT,
 FROM data.reseau_routier;
 ```
 
-Création du réseau sur la base des intersection
+**Création du réseau sur la base des intersection**
 
 ```{sql, connection = con}
 
@@ -319,7 +321,7 @@ FROM analyse_pgrouting.new_reseau_vertices AS v
 WHERE ST_DWithin(ST_EndPoint(r.geom), v.geom, 0.000001);
 ```
 
-### Préparation de la table des points de départ et arrivée
+### Préparation des tables des points de départ et arrivée
 
 ```{sql, connection = con}
 DROP TABLE IF EXISTS analyse_pgrouting.pt_depart ;
@@ -362,187 +364,220 @@ arrivee_sf <- sf::st_as_sf(coord_arrivee, coords = c("long", "lat"),crs = 4326) 
   rename(geog = geometry)
 ```
 
-## Création des tables Hébergeantes pour l'opération trigger
+## Création des tables hébergeant les opérations trigger
 
-```{sql connection = con}
+```{sql, connection = con}
+-- Table intermédiaire : station BIXI la plus proche du départ
+DROP TABLE IF EXISTS analyse_pgrouting.pt_depart_bixi;
+CREATE TABLE analyse_pgrouting.pt_depart_bixi (
+    id         BIGSERIAL PRIMARY KEY,
+    osm_id     BIGINT,
+    station_id TEXT,
+    name       TEXT,
+    distance   DOUBLE PRECISION,
+    geom       GEOMETRY(Point, 4326)
+);
+```
 
--- Création d'une table de départ sur les noeuds du réseau
-
+```{sql, connection = con}
+-- Table finale : nœud réseau le plus proche de la station BIXI de départ
 DROP TABLE IF EXISTS analyse_pgrouting.pt_depart_reseau;
-
 CREATE TABLE analyse_pgrouting.pt_depart_reseau (
-    id BIGSERIAL PRIMARY KEY, -- big serial permet d'obtenir des valeurs automatiquement attribuées
-    osm_id BIGINT,
+    id       BIGSERIAL PRIMARY KEY,
+    osm_id   BIGINT,
     id_noeud BIGINT,
     distance DOUBLE PRECISION
 );
 ```
 
-```{sql connection = con}
-
--- Création d'une table d'arrivée sur les noeuds du réseau
-
-DROP TABLE IF EXISTS analyse_pgrouting.pt_arrivee_reseau;
-
-CREATE TABLE analyse_pgrouting.pt_arrivee_reseau (
-    id BIGSERIAL PRIMARY KEY,
-    osm_id BIGINT,
-    id_noeud BIGINT,
-    distance DOUBLE PRECISION
-);
-```
-
-### Fonction trigger
-
-```{sql connection = con}
-
--- Créer la fonction pour calculer la station de bixi la plus proche
-
-CREATE OR REPLACE FUNCTION fct_depart_node_network() 
+```{sql, connection = con}
+-- Trigger 1 départ : adresse → station BIXI la plus proche
+CREATE OR REPLACE FUNCTION fct_depart_bixi()
 RETURNS TRIGGER AS $$
 BEGIN
-    INSERT INTO analyse_pgrouting.pt_depart_reseau (
-        osm_id, 
-        id_noeud,
-        distance
+    INSERT INTO analyse_pgrouting.pt_depart_bixi (
+        osm_id, station_id, name, distance, geom
     )
-    SELECT 
+    SELECT
         NEW.osm_id,
-        n.id,
-        ST_Distance(NEW.geog::geography, n.geom::geography)
-    FROM analyse_pgrouting.new_reseau_vertices n
-    ORDER BY NEW.geog::geography <-> n.geom::geography
+        b.station_id,
+        b.name,
+        ST_Distance(NEW.geog, b.geom::geography),
+        b.geom
+    FROM data.bixi_stations b
+    ORDER BY NEW.geog <-> b.geom::geography
     LIMIT 1;
-
     RETURN NEW;
 END;
 $$ LANGUAGE plpgsql;
 ```
 
-#### Création du tigger sur la table de données
+```{sql, connection = con}
+DROP TRIGGER IF EXISTS trg_fct_depart_bixi ON analyse_pgrouting.pt_depart;
 
-Ici il s'agit de préciser l'évènement, dans sa nature et dans sa temporalité. a partir de AFTER INSERT ON indique que le trigger sera exécuté (EXECUTE FUNCTION) dès qu'il y aura une insertion sur la table précisée et ce pour chaque ligne (EACH ROW).
+CREATE TRIGGER trg_fct_depart_bixi
+AFTER INSERT ON analyse_pgrouting.pt_depart
+FOR EACH ROW
+EXECUTE FUNCTION fct_depart_bixi();
+```
 
-```{sql connection = con}
+```{sql, connection = con}
+-- Trigger 2 départ : station BIXI → nœud réseau le plus proche
+CREATE OR REPLACE FUNCTION fct_depart_node_network()
+RETURNS TRIGGER AS $$
+BEGIN
+    INSERT INTO analyse_pgrouting.pt_depart_reseau (
+        osm_id, id_noeud, distance
+    )
+    SELECT
+        NEW.osm_id,
+        n.id,
+        ST_Distance(NEW.geom::geography, n.geom::geography)
+    FROM analyse_pgrouting.new_reseau_vertices n
+    ORDER BY NEW.geom::geography <-> n.geom::geography
+    LIMIT 1;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+```
 
-DROP TRIGGER IF EXISTS trg_fct_depart_node_network ON analyse_pgrouting.pt_depart;
+```{sql, connection = con}
+DROP TRIGGER IF EXISTS trg_fct_depart_node_network ON analyse_pgrouting.pt_depart_bixi;
 
 CREATE TRIGGER trg_fct_depart_node_network
-AFTER INSERT ON analyse_pgrouting.pt_depart 
+AFTER INSERT ON analyse_pgrouting.pt_depart_bixi
 FOR EACH ROW
 EXECUTE FUNCTION fct_depart_node_network();
 ```
 
-#### Import du nouveau point dans la base de données
-
-Maintenant que le trigger est défni on peut ajouter notre point de départ à notre table. Dès que ce sera fait le trigger s'exécutera et vous aurez une automatisation totale du geotaggage entre le point initial et le noeud le plus proche sur le réseau.
-
 ```{r}
-# Insertion des valeurs dans table dans un schéma précis
-dbWriteTable(
-  conn = con,
-  name = Id(schema = "analyse_pgrouting", table = "pt_depart"),  # schéma + table
-  value = depart_sf,
-  append = TRUE,
-  row.names = FALSE
-)
-
+# Insertion départ — déclenche trigger 1 (→ BIXI) puis trigger 2 (→ nœud réseau)
+dbWriteTable(con, Id(schema = "analyse_pgrouting", table = "pt_depart"),
+             value = depart_sf, append = TRUE, row.names = FALSE)
 ```
 
-### Réalisation de la fonction du trigger sur table d'arrivée
+```{sql, connection = con}
+-- Table intermédiaire : station BIXI la plus proche de l'arrivée
+DROP TABLE IF EXISTS analyse_pgrouting.pt_arrivee_bixi;
+CREATE TABLE analyse_pgrouting.pt_arrivee_bixi (
+    id         BIGSERIAL PRIMARY KEY,
+    osm_id     BIGINT,
+    station_id TEXT,
+    name       TEXT,
+    distance   DOUBLE PRECISION,
+    geom       GEOMETRY(Point, 4326)
+);
+```
 
-Même principe que sur la table de départ. Essayez de commenter votre code.
+```{sql, connection = con}
+-- Table finale : nœud réseau le plus proche de la station BIXI d'arrivée
+DROP TABLE IF EXISTS analyse_pgrouting.pt_arrivee_reseau;
+CREATE TABLE analyse_pgrouting.pt_arrivee_reseau (
+    id       BIGSERIAL PRIMARY KEY,
+    osm_id   BIGINT,
+    id_noeud BIGINT,
+    distance DOUBLE PRECISION
+);
+```
 
-```{sql connection = con}
-
-CREATE OR REPLACE FUNCTION fct_arrivee_node_network() 
+```{sql, connection = con}
+-- Trigger 1 arrivée : adresse → station BIXI la plus proche
+CREATE OR REPLACE FUNCTION fct_arrivee_bixi()
 RETURNS TRIGGER AS $$
 BEGIN
-    INSERT INTO analyse_pgrouting.pt_arrivee_reseau (
-        osm_id,
-        id_noeud,
-        distance
+    INSERT INTO analyse_pgrouting.pt_arrivee_bixi (
+        osm_id, station_id, name, distance, geom
     )
-    SELECT 
+    SELECT
         NEW.osm_id,
-        n.id,
-        ST_Distance(NEW.geog::geography, n.geom::geography)
-    FROM analyse_pgrouting.new_reseau_vertices n
-    ORDER BY NEW.geog::geography <-> n.geom::geography
+        b.station_id,
+        b.name,
+        ST_Distance(NEW.geog, b.geom::geography),
+        b.geom
+    FROM data.bixi_stations b
+    ORDER BY NEW.geog <-> b.geom::geography
     LIMIT 1;
-
     RETURN NEW;
 END;
 $$ LANGUAGE plpgsql;
 ```
 
-#### Création du tigger sur la table de données
+```{sql, connection = con}
+DROP TRIGGER IF EXISTS trg_fct_arrivee_bixi ON analyse_pgrouting.pt_arrivee;
 
-```{sql connection = con}
+CREATE TRIGGER trg_fct_arrivee_bixi
+AFTER INSERT ON analyse_pgrouting.pt_arrivee
+FOR EACH ROW
+EXECUTE FUNCTION fct_arrivee_bixi();
+```
 
-DROP TRIGGER IF EXISTS trg_fct_arrivee_node_network ON analyse_pgrouting.pt_arrive;
+```{sql, connection = con}
+-- Trigger 2 arrivée : station BIXI → nœud réseau le plus proche
+CREATE OR REPLACE FUNCTION fct_arrivee_node_network()
+RETURNS TRIGGER AS $$
+BEGIN
+    INSERT INTO analyse_pgrouting.pt_arrivee_reseau (
+        osm_id, id_noeud, distance
+    )
+    SELECT
+        NEW.osm_id,
+        n.id,
+        ST_Distance(NEW.geom::geography, n.geom::geography)
+    FROM analyse_pgrouting.new_reseau_vertices n
+    ORDER BY NEW.geom::geography <-> n.geom::geography
+    LIMIT 1;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+```
+
+```{sql, connection = con}
+DROP TRIGGER IF EXISTS trg_fct_arrivee_node_network ON analyse_pgrouting.pt_arrivee_bixi;
 
 CREATE TRIGGER trg_fct_arrivee_node_network
-AFTER INSERT ON analyse_pgrouting.pt_arrivee
+AFTER INSERT ON analyse_pgrouting.pt_arrivee_bixi
 FOR EACH ROW
 EXECUTE FUNCTION fct_arrivee_node_network();
 ```
 
-#### Import du nouveau point dans la base de données
-
 ```{r}
-# Insertion des valeurs dans table dans un schéma précis
-dbWriteTable(
-  conn = con,
-  name = Id(schema = "analyse_pgrouting", table = "pt_arrivee"),  # schéma + table
-  value = arrivee_sf,
-  append = TRUE,
-  row.names = FALSE
-)
-
+# Insertion arrivée — déclenche trigger 1 (→ BIXI) puis trigger 2 (→ nœud réseau)
+dbWriteTable(con, Id(schema = "analyse_pgrouting", table = "pt_arrivee"),
+             value = arrivee_sf, append = TRUE, row.names = FALSE)
 ```
 
-### Calcul plus court chemin
-
-On calcule maintenant le plus court chemin. Je précise de réaliser l'algortihme à partir du dernier ajout sur la table (relatif au numéro de l'identifiant le plus élevé.)
+### Calcul du plus court chemin
 
 ```{sql, connection = con}
-
 DROP TABLE IF EXISTS analyse_pgrouting.new_shpath2;
 CREATE TABLE analyse_pgrouting.new_shpath2 AS
-SELECT * 
+SELECT *
 FROM pgr_dijkstra(
-    'SELECT id_trc AS id, source::INT4, target::INT4, cost FROM analyse_pgrouting.new_reseau
-     WHERE source IS NOT NULL
-      AND target IS NOT NULL'::text,
-      (SELECT id_noeud  FROM analyse_pgrouting.pt_depart_reseau
-     ORDER BY id_noeud DESC LIMIT 1), -- noeud de départ
-      (SELECT id_noeud  FROM analyse_pgrouting.pt_arrivee_reseau
-      ORDER BY id_noeud DESC LIMIT 1),   -- noeud d'arrivée
-   false -- non dirigé
+    'SELECT id_trc AS id, source::INT4, target::INT4, cost
+     FROM analyse_pgrouting.new_reseau
+     WHERE source IS NOT NULL AND target IS NOT NULL'::text,
+    (SELECT id_noeud FROM analyse_pgrouting.pt_depart_reseau ORDER BY id DESC LIMIT 1),
+    (SELECT id_noeud FROM analyse_pgrouting.pt_arrivee_reseau ORDER BY id DESC LIMIT 1),
+    false
 );
 ```
 
-### Jointure avec le reste du réseau
-
-On peut joindre la table des résultats avec la géométrie du réseau pour une visualisation.
+### Jointure avec la géométrie du réseau
 
 ```{sql, connection = con}
-
 DROP TABLE IF EXISTS analyse_pgrouting.new_shpath2_geom;
-
 CREATE TABLE analyse_pgrouting.new_shpath2_geom AS
-SELECT   sp.seq,            -- séquence du chemin
-    sp.node,           -- noeud actuel
-    sp.edge,           -- id de l’arête
-    sp.cost,           -- coût de l’arête
-    r.id_trc,       -- id de la rue
-    r.geom,            -- géométrie de la rue
+SELECT
+    sp.seq,
+    sp.node,
+    sp.edge,
+    sp.cost,
+    r.id_trc,
+    r.geom,
     r.source,
     r.target
 FROM analyse_pgrouting.new_shpath2 AS sp
-LEFT JOIN analyse_pgrouting.new_reseau AS r
-    ON sp.edge = r.id_trc;
+LEFT JOIN analyse_pgrouting.new_reseau AS r ON sp.edge = r.id_trc;
 ```
 
 ### Visualisation
