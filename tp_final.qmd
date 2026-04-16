@@ -1,13 +1,9 @@
 ---
-title: "tp_final"
+title: "tp_final_geo6360"
 author: "Yaye Aissatou Gueye, Frédéric Lemyre-Corbeil, Robin Durand"
 format: html
 editor: visual
-execute:
-  eval: false
 ---
-
-## Chargement library
 
 ```{r}
 library(odbc) # provides drivers to connect to different SQL dialects
@@ -15,21 +11,41 @@ library(DBI)  # provides functions to interact with the database
 library(sf) # Bibliothèque pour l'analyse et traitement des données spatiales
 library(tidyverse) # Data science tools
 library(mapview) # Visu rapide et dynamique des objets spatiaux
+library(httr) # envoie une demande à l'API du portail CKAN qu'on utilise pour aller chercher les données ouvertes de Montréal
+library(jsonlite) # interprète le json
+
 ```
 
-## Connexion à la BD
+```{r}
+con_init <- dbConnect(odbc::odbc(),
+  Driver   = "PostgreSQL Unicode",
+  Database = "postgres",          # BD système par défaut
+  Server   = "localhost",
+  UID      = "postgres",
+  PWD      = "donneeslemig2025"
+)
+
+# Création de la BD si elle n'existe pas déjà
+if (!("projet_final_test16avril" %in% dbGetQuery(con_init, "SELECT datname FROM pg_database")$datname)) {
+  dbExecute(con_init, "CREATE DATABASE projet_final_test16avril")
+}
+
+dbDisconnect(con_init) # On ferme la connexion initiale
+
+```
 
 ```{r}
+
 con<- dbConnect(odbc::odbc(),
  Driver = "PostgreSQL Unicode",
- Database = "projet_final",
+ Database = "projet_final_test16avril",
  Server = "localhost",
  UID = "postgres",
  PWD = "donneeslemig2025" # Ne jamais diffuser un mdp personnel
 )
 ```
 
-## stations bixi
+### stations bixi
 
 ```{sql, connection = con}
 
@@ -63,7 +79,7 @@ CREATE TEMP TABLE tmp_bixi (data jsonb);
 
 # passe en r pout accéder au fichier avec un chemin de client local
 
-bixi_raw <- readr::read_file("U:/projet_final/bixi.json")
+bixi_raw <- readr::read_file("https://gbfs.velobixi.com/gbfs/fr/station_information.json")
 DBI::dbExecute(con, "INSERT INTO tmp_bixi VALUES (?)", list(bixi_raw))
 ```
 
@@ -85,68 +101,368 @@ SELECT
 FROM tmp_bixi, jsonb_array_elements(data->'data'->'stations') AS elem ON CONFLICT (station_id) DO NOTHING; -- passe pour possibilité de réexécution du code
 ```
 
-## réseau viaire
+### pistes cyclables
 
 ```{sql, connection = con}
-
-CREATE EXTENSION IF NOT EXISTS postgis;
 CREATE SCHEMA IF NOT EXISTS data;
 
-DROP TABLE IF EXISTS data.bixi_stations; -- passe pour possibilité de réexécution du code
+-- Suppression pour permettre la réexécution
+DROP TABLE IF EXISTS data.reseau_cyclable;
 
-CREATE TABLE data.bixi_stations (
-    station_id   TEXT PRIMARY KEY,
-    external_id  TEXT,
-    name         TEXT,
-    short_name   TEXT,
-    capacity     INTEGER,
-    rental_methods TEXT[],
-    is_charging  BOOLEAN,
-    has_kiosk    BOOLEAN,
-    geom         GEOMETRY(Point, 4326)
+CREATE TABLE data.reseau_cyclable (
+    id_cycl INT PRIMARY KEY,
+    longueur FLOAT,
+    nbr_voie FLOAT,
+    geom GEOMETRY(MultiLineString, 4326)
 );
 
-DROP TABLE IF EXISTS tmp_bixi;
-
-CREATE TEMP TABLE tmp_bixi (data jsonb);
+-- Table temporaire pour le JSON brut
+DROP TABLE IF EXISTS tmp_cyclable;
+CREATE TEMP TABLE tmp_cyclable (data jsonb);
 ```
 
 ```{r}
-bixi_raw <- readr::read_file("U:/projet_final/bixi.json")
-DBI::dbExecute(con, "INSERT INTO tmp_bixi VALUES (?)", list(bixi_raw))
+# 1. Identifiant stable de la ressource (trouvé dans l'URL de la page ou via l'API)
+resource_id <- "0dc6612a-be66-406b-b2d9-59c9e1c65ebf"
+api_url <- paste0("https://donnees.montreal.ca/api/3/action/resource_show?id=", resource_id)
+
+# 2. Récupérer les métadonnées de la ressource pour obtenir l'URL de téléchargement actuelle
+res <- GET(api_url)
+data_info <- fromJSON(content(res, "text"))
+
+# 3. Extraire l'URL (qui inclura le nouveau jeton valide)
+download_url <- data_info$result$url
+
+# 4. Télécharger le contenu
+pistes_raw <- readr::read_file(download_url)
+
+# 5. Insertion SQL (votre code d'origine reste le même)
+DBI::dbExecute(con, "INSERT INTO tmp_cyclable VALUES (?)", list(pistes_raw))
 ```
 
 ```{sql, connection = con}
+-- Import des données brutes de la table temporaire vers notre vraie table
+-- Note : Le GeoJSON utilise 'features' au lieu de 'data->stations'
 
-INSERT INTO data.bixi_stations
+INSERT INTO data.reseau_cyclable (id_cycl, longueur, nbr_voie, geom)
 SELECT
-    elem->>'station_id',
-    elem->>'external_id',
-    elem->>'name',
-    elem->>'short_name',
-    (elem->>'capacity')::int,
-    ARRAY(SELECT jsonb_array_elements_text(elem->'rental_methods')),
-    (elem->>'is_charging')::boolean,
-    (elem->>'has_kiosk')::boolean,
-    ST_SetSRID(ST_MakePoint((elem->>'lon')::float, (elem->>'lat')::float), 4326)
-FROM tmp_bixi, jsonb_array_elements(data->'data'->'stations') AS elem ON CONFLICT (station_id) DO NOTHING; -- passe pour possibilité de réexécution du code
+    (elem->'properties'->>'ID_CYCL')::int,
+    (elem->'properties'->>'LONGUEUR')::float,
+    (elem->'properties'->>'NBR_VOIE')::float,
+    -- Conversion du GeoJSON en géométrie PostGIS. 
+    -- On utilise ST_Multi car votre table attend du MultiLineString
+    ST_SetSRID(
+        ST_Multi(ST_GeomFromGeoJSON(elem->>'geometry')), 
+        4326
+    )
+FROM 
+    tmp_cyclable, 
+    jsonb_array_elements(data->'features') AS elem 
+ON CONFLICT (id_cycl) DO NOTHING;
+```
+
+### réseau routier
+
+```{sql, connection = con}
+
+-- création d'une table dans la bd pour accueillir les données du json du réseau routier qui seront manipulables par la suite. On règle les champs pour mimer le contenu du json. (postgres ne prend pas les json comme formats natifs).
+
+CREATE SCHEMA IF NOT EXISTS data;
+
+DROP TABLE IF EXISTS data.reseau_routier;
+CREATE TABLE data.reseau_routier (
+    id_trc    INTEGER PRIMARY KEY,
+    nom_voie  TEXT,
+    typ_voie  TEXT,
+    odonyme   TEXT,
+    arr_gch   TEXT,
+    arr_drt   TEXT,
+    sens_cir  SMALLINT,
+    classe    SMALLINT,
+    geom      GEOMETRY(MultiLineString, 4326) -- MultiLineString est plus sûr
+);
+
+DROP TABLE IF EXISTS data.tmp_resrout;
+CREATE TABLE data.tmp_resrout (data jsonb);
 
 ```
 
-## Installation de pgrouting
+```{r}
+# On cible le jeu de données 'geobase'
+package_id <- "geobase"
+api_url <- paste0("https://donnees.montreal.ca/api/3/action/package_show?id=", package_id)
+
+# Récupération des infos du package
+res <- GET(api_url)
+stop_for_status(res)
+package_info <- fromJSON(content(res, "text"))
+
+# Extraction de l'URL du GeoJSON
+resources <- package_info$result$resources
+download_url <- resources$url[resources$format == "GeoJSON"][1]
+
+if (is.null(download_url)) stop("Impossible de trouver l'URL du GeoJSON.")
+
+# Téléchargement et Lecture
+# On utilise un fichier temporaire car le fichier est lourd
+temp_geo <- tempfile(fileext = ".geojson")
+message("Téléchargement de la Géobase (URL signée)...")
+download.file(download_url, destfile = temp_geo, mode = "wb", quiet = TRUE)
+
+geobase_raw <- readr::read_file(temp_geo)
+
+# Envoi vers PostgreSQL
+DBI::dbExecute(con, "TRUNCATE data.tmp_resrout;")
+DBI::dbExecute(con, "INSERT INTO data.tmp_resrout (data) VALUES (?)", list(geobase_raw))
+
+# Nettoyage
+unlink(temp_geo)
+rm(geobase_raw)
+gc()
+message("Données brutes importées avec succès !")
+```
 
 ```{sql, connection = con}
+-- import des données brutes de la table temporaire vers notre vraie table (postgres ne prend pas les json comme formats natifs)
+
+INSERT INTO data.reseau_routier (id_trc, nom_voie, typ_voie, odonyme, arr_gch, arr_drt, sens_cir, classe, geom)
+SELECT
+    (feat->'properties'->>'ID_TRC')::int,
+    feat->'properties'->>'NOM_VOIE',
+    feat->'properties'->>'TYP_VOIE',
+    feat->'properties'->>'ODONYME',
+    feat->'properties'->>'ARR_GCH',
+    feat->'properties'->>'ARR_DRT',
+    (feat->'properties'->>'SENS_CIR')::smallint,
+    (feat->'properties'->>'CLASSE')::smallint,
+    ST_SetSRID(ST_Multi(ST_GeomFromGeoJSON(feat->>'geometry')), 4326) 
+FROM 
+    data.tmp_resrout, 
+    jsonb_array_elements(data->'features') AS feat 
+ON CONFLICT (id_trc) DO NOTHING;
+
+-- Optionnel : Créer un index pour accélérer les futures requêtes
+CREATE INDEX IF NOT EXISTS resrout_geom_idx ON data.reseau_routier USING GIST (geom);
+
+```
+
+```{sql, connection = con}
+
+-- vérification que nos tables sont bien peuplées
+
+SELECT 'bixi_stations' AS table_name, COUNT(*) FROM data.bixi_stations
+UNION ALL
+SELECT 'reseau_cylable', COUNT(*) FROM data.reseau_cyclable;
+SELECT 'reseau_routier', COUNT(*) FROM data.reseau_routier;
+```
+
+**Création des index spatiaux (data) pour la transformation des données.**
+
+```{sql, connection = con}
+
+CREATE INDEX ON data.bixi_stations  USING GIST (geom);
+CREATE INDEX ON data.reseau_cyclable  USING GIST (geom);
+CREATE INDEX ON data.reseau_routier USING GIST (geom);
+```
+
+**Création d'un nouveau schéma pgrouting pour l'analyse**
+
+```{sql, connection = con}
+
 --installation de pgrouting
 CREATE EXTENSION IF NOT EXISTS pgrouting;
 
+-- création du schéma dédié
+CREATE SCHEMA IF NOT EXISTS analyse_pgrouting;
+
+-- gestion des chemins d'accès
+SET search_path = analyse_pgrouting, data, public;
 ```
 
-## Géocodage
-### test adresses
-```{r}
-adresse_depart <- "275 Rue Notre-Dame Est, Montréal, QC H2Y 1C6"
-adresse_arrivee <- "4450 Rue Saint-Hubert, Montréal, QC H2J 2W9"
+**Import du réseau dans le schéma pgrouting**
+
+```{sql, connection = con}
+-- Transformer les MULTILINESTRING en LINESTRING
+DROP TABLE IF EXISTS analyse_pgrouting.new_reseau;
+
+CREATE TABLE analyse_pgrouting.new_reseau AS
+SELECT id_trc::BIGINT,
+    (ST_Dump(geom)).geom AS geom
+FROM data.reseau_routier;
+
+DROP TABLE IF EXISTS analyse_pgrouting.reseau;
+
+CREATE TABLE analyse_pgrouting.reseau AS
+SELECT id_trc::BIGINT,
+    (ST_Dump(geom)).geom AS geom
+FROM data.reseau_routier;
 ```
+
+**Création du réseau sur la base des intersection**
+
+```{sql, connection = con}
+
+DROP TABLE IF EXISTS analyse_pgrouting.new_reseau;
+
+CREATE TABLE analyse_pgrouting.new_reseau AS
+-- Étape 1 : calcul des points d'intersection
+WITH 
+points_intersection AS (
+SELECT DISTINCT ST_Intersection(a.geom, b.geom) AS geom -- géométrie de l'intersection
+FROM analyse_pgrouting.reseau a
+JOIN analyse_pgrouting.reseau b
+  ON a.id_trc < b.id_trc -- Evite une double opération redondante
+WHERE ST_Intersects(a.geom, b.geom) -- uniquement là où il y a une intersection effective entre les géométries.
+  AND GeometryType(ST_Intersection(a.geom, b.geom)) = 'POINT'),  -- retient unqiuement les points issus de l'intersection.
+  -- Étape 2 : découpage des lignes par ces points
+decoupage_ligne AS (
+SELECT (ST_Dump(ST_Split(r.geom, pts.geom))).geom AS geom -- je déconstruis mes lignes du réseau de base à chaque rencontre de spoitns d'intersection (géométries uniques ici !) et je les simplifie en simple ligne (dump). Cela suppose que, par la suite, chaque point d'une ligne sera considéré comme le point de départ ou d'arrivée d'un segment. 
+FROM analyse_pgrouting.reseau AS r
+CROSS JOIN (  -- pour chaque ligne du réseau on associe tous les points d'intersection
+    SELECT ST_Union(geom) AS geom  -- on unifie tous les points d'intersection (pour splitter)
+    FROM points_intersection
+) AS pts)
+-- Étape 3 : garder uniquement les LINESTRING et supprimer les doublons
+SELECT DISTINCT geom
+FROM decoupage_ligne
+WHERE GeometryType(geom) = 'LINESTRING';
+
+```
+
+**Création clé primaire**
+
+```{sql, connection = con}
+-- Créer la séquence pour ID incrémental
+DROP SEQUENCE IF EXISTS analyse_pgrouting.street_seq;
+CREATE SEQUENCE analyse_pgrouting.street_seq START 1;
+ALTER TABLE analyse_pgrouting.new_reseau
+ADD COLUMN IF NOT EXISTS id_trc BIGINT;
+UPDATE analyse_pgrouting.new_reseau
+SET id_trc = nextval('analyse_pgrouting.street_seq');
+```
+
+**Création d'index spatiaux (pgrouting)**
+
+```{sql, connection = con}
+CREATE INDEX IF NOT EXISTS idx_geom_newreseau ON analyse_pgrouting.new_reseau USING gist(geom); -- création de mon objet index sur le réseau  
+```
+
+**Ajout des colonnes pour créer la topologie**
+
+```{sql connection=con}
+-- 1. Ajouter les colonnes nécessaires (incluant is_cycleway)
+ALTER TABLE analyse_pgrouting.new_reseau DROP COLUMN IF EXISTS source;
+ALTER TABLE analyse_pgrouting.new_reseau ADD COLUMN source BIGINT;
+
+ALTER TABLE analyse_pgrouting.new_reseau DROP COLUMN IF EXISTS target;
+ALTER TABLE analyse_pgrouting.new_reseau ADD COLUMN target BIGINT;
+
+ALTER TABLE analyse_pgrouting.new_reseau DROP COLUMN IF EXISTS cost;
+ALTER TABLE analyse_pgrouting.new_reseau ADD COLUMN cost REAL;
+
+-- Nouvelle colonne pour identifier les pistes
+ALTER TABLE analyse_pgrouting.new_reseau DROP COLUMN IF EXISTS is_cycleway;
+ALTER TABLE analyse_pgrouting.new_reseau ADD COLUMN is_cycleway BOOLEAN DEFAULT FALSE;
+
+-- 2. Calcul du coût de base (distance réelle en mètres)
+UPDATE analyse_pgrouting.new_reseau 
+SET cost = ST_Length(geom::geography);
+
+-- 3. Identification des pistes cyclables (Jointure spatiale)
+-- On marque les segments de route qui sont à moins de 2m d'une piste cyclable
+UPDATE analyse_pgrouting.new_reseau r
+SET is_cycleway = TRUE
+FROM data.reseau_cyclable c
+WHERE ST_DWithin(r.geom::geography, c.geom::geography, 2);
+
+-- 4. Priorisation : on réduit le coût de moitié pour les pistes
+-- L'algorithme Dijkstra préférera un chemin plus long s'il est "moins cher" (cyclable)
+UPDATE analyse_pgrouting.new_reseau
+SET cost = cost / 2
+WHERE is_cycleway = TRUE;
+```
+
+
+```{sql, connection = con}
+-- Colonne source
+ALTER TABLE analyse_pgrouting.new_reseau DROP COLUMN  IF EXISTS source;
+ALTER TABLE  analyse_pgrouting.new_reseau ADD COLUMN "source" BIGINT;
+
+--Colonnes target
+ALTER TABLE  analyse_pgrouting.new_reseau DROP COLUMN IF EXISTS target;
+ALTER TABLE  analyse_pgrouting.new_reseau ADD COLUMN "target" BIGINT;
+
+-- Ajouter une var sur la longueur de chaque tronçon
+ALTER TABLE  analyse_pgrouting.new_reseau DROP COLUMN IF EXISTS cost;
+ALTER TABLE  analyse_pgrouting.new_reseau ADD COLUMN cost REAL;
+
+UPDATE  analyse_pgrouting.new_reseau 
+SET cost = ST_Length(geom::geography); -- calcul sur l'elliposide en m.
+
+```
+
+### Extraction des sommets
+
+```{sql, connection = con}
+DROP TABLE IF EXISTS analyse_pgrouting.new_reseau_vertices;
+SELECT * INTO analyse_pgrouting.new_reseau_vertices
+FROM pgr_extractVertices(
+    'SELECT id_trc AS id, geom FROM analyse_pgrouting.new_reseau'
+    )
+    ;
+
+```
+
+### Création index
+
+```{sql, connection = con}
+CREATE INDEX IF NOT EXISTS idx_geom_newreseau_vertices ON analyse_pgrouting.new_reseau_vertices USING gist(geom); -- création de mon objet index sur le réseau 
+```
+
+### Création de la topologie
+
+Ici j'ai modifié le code par rapport à l'atelier 7 pour une solution plus rapide.
+
+```{sql, connection = con}
+-- Associer arrêtes et noeuds point de départ
+UPDATE analyse_pgrouting.new_reseau AS r
+SET source = v.id
+FROM analyse_pgrouting.new_reseau_vertices AS v
+WHERE ST_DWithin(ST_StartPoint(r.geom), v.geom, 0.000001);
+```
+
+```{sql, connection = con}
+-- Associer arrêtes et noeuds point d'arrivée
+UPDATE analyse_pgrouting.new_reseau AS r
+SET target = v.id
+FROM analyse_pgrouting.new_reseau_vertices AS v
+WHERE ST_DWithin(ST_EndPoint(r.geom), v.geom, 0.000001);
+```
+
+### Préparation de la table des points de départ et arrivée
+
+```{sql, connection = con}
+DROP TABLE IF EXISTS analyse_pgrouting.pt_depart ;
+CREATE TABLE IF NOT EXISTS analyse_pgrouting.pt_depart (
+osm_id BIGINT, address TEXT, geog geography(POINT,4326)
+)
+```
+
+```{sql, connection = con}
+DROP TABLE IF EXISTS analyse_pgrouting.pt_arrivee ;
+CREATE TABLE IF NOT EXISTS analyse_pgrouting.pt_arrivee (
+osm_id BIGINT, address TEXT, geog geography(POINT,4326)
+)
+```
+
+### Géotagging
+
+```{r}
+adresse_depart <- "5407 Rue Clark, Montréal, QC H2T 2V3, CANADA"
+adresse_arrivee <- "1375 Ave.Thérèse-Lavoie-Roux, Montréal, QC H2V 0B3, CANADA"
+
+```
+
 ```{r}
 library(tidygeocoder)
 # ??tidygeocoder
@@ -167,4 +483,205 @@ arrivee_sf <- sf::st_as_sf(coord_arrivee, coords = c("long", "lat"),crs = 4326) 
   select(osm_id, address, geometry)%>%
   rename(geog = geometry)
 
+```
+
+### Table de départ
+
+cette table collecte les informations à l'issue de l'exécution du trigger
+
+```{sql connection = con}
+--DROP TABLE IF EXISTS analyse_pgrouting.pt_depart_reseau;
+CREATE TABLE analyse_pgrouting.pt_depart_reseau (
+    id BIGSERIAL PRIMARY KEY, -- big serial permet d'obtenir des valeurs automatiquement attribuées
+    osm_id BIGINT,
+    id_noeud BIGINT,
+    distance DOUBLE PRECISION
+);
+```
+
+### Table d'arrivée
+
+cette table collecte les informations à l'issue de l'exécution du trigger
+
+```{sql connection = con}
+--DROP TABLE IF EXISTS analyse_pgrouting.pt_arrivee_reseau;
+CREATE TABLE analyse_pgrouting.pt_arrivee_reseau (
+    id BIGSERIAL PRIMARY KEY,
+    osm_id BIGINT,
+    id_noeud BIGINT,
+    distance DOUBLE PRECISION
+);
+```
+
+### Réalisation de la fonction du trigger sur table de départ
+
+```{sql connection = con}
+-- Créer la fonction pour calculer la station de métro la plus proche
+
+CREATE OR REPLACE FUNCTION fct_depart_node_network() 
+RETURNS TRIGGER AS $$
+BEGIN
+    INSERT INTO analyse_pgrouting.pt_depart_reseau (
+        osm_id,
+        id_noeud,
+        distance
+    )
+    SELECT 
+        NEW.osm_id,
+        n.id,
+        ST_Distance(NEW.geog::geography, n.geom::geography)
+    FROM analyse_pgrouting.new_reseau_vertices n
+    ORDER BY NEW.geog::geography <-> n.geom::geography
+    LIMIT 1;
+
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+```
+
+```{sql connection = con}
+-- Supprimer le trigger s'il existe déjà
+DROP TRIGGER IF EXISTS trg_fct_depart_node_network ON analyse_pgrouting.pt_depart;
+
+CREATE TRIGGER trg_fct_depart_node_network
+AFTER INSERT ON analyse_pgrouting.pt_depart
+FOR EACH ROW
+EXECUTE FUNCTION fct_depart_node_network();
+```
+
+```{r}
+# Insertion des valeurs dans table dans un schéma précis
+dbWriteTable(
+  conn = con,
+  name = Id(schema = "analyse_pgrouting", table = "pt_depart"),  # schéma + table
+  value = depart_sf,
+  append = TRUE,
+  row.names = FALSE
+)
+
+```
+
+```{sql connection = con}
+CREATE OR REPLACE FUNCTION fct_arrivee_node_network() 
+RETURNS TRIGGER AS $$
+BEGIN
+    INSERT INTO analyse_pgrouting.pt_arrivee_reseau (
+        osm_id,
+        id_noeud,
+        distance
+    )
+    SELECT 
+        NEW.osm_id,
+        n.id,
+        ST_Distance(NEW.geog::geography, n.geom::geography)
+    FROM analyse_pgrouting.new_reseau_vertices n
+    ORDER BY NEW.geog::geography <-> n.geom::geography
+    LIMIT 1;
+
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+```
+
+#### Création du tigger sur la table de données
+
+```{sql connection = con}
+CREATE TRIGGER trg_fct_arrivee_node_network
+AFTER INSERT ON analyse_pgrouting.pt_arrivee
+FOR EACH ROW
+EXECUTE FUNCTION fct_arrivee_node_network();
+```
+
+#### Import du nouveau point dans la base de données
+
+```{r}
+# Insertion des valeurs dans table dans un schéma précis
+dbWriteTable(
+  conn = con,
+  name = Id(schema = "analyse_pgrouting", table = "pt_arrivee"),  # schéma + table
+  value = arrivee_sf,
+  append = TRUE,
+  row.names = FALSE
+)
+
+```
+
+### Calcul plus court chemin
+
+On calcule maintenant le plus court chemin. Je précise de réaliser l'algortihme à partir du dernier ajout sur la table (relatif au numéro de l'identifiant le plus élevé.)
+
+```{sql, connection = con}
+
+DROP TABLE IF EXISTS analyse_pgrouting.new_shpath2;
+CREATE TABLE analyse_pgrouting.new_shpath2 AS
+SELECT * FROM pgr_dijkstra(
+    -- Changement ici : id_trc au lieu de id_street
+    'SELECT id_trc AS id, source::INT4, target::INT4, cost FROM analyse_pgrouting.new_reseau
+     WHERE source IS NOT NULL
+      AND target IS NOT NULL'::text,
+      -- Changement ici : trier par "id" pour avoir le dernier point inséré
+      (SELECT id_noeud FROM analyse_pgrouting.pt_depart_reseau
+       ORDER BY id DESC LIMIT 1), 
+      (SELECT id_noeud FROM analyse_pgrouting.pt_arrivee_reseau
+       ORDER BY id DESC LIMIT 1),   
+    false -- non dirigé
+);
+```
+
+### Jointure avec le reste du réseau
+
+On peut joindre la table des résultats avec la géométrie du réseau pour une visualisation.
+
+```{sql, connection = con}
+
+DROP TABLE IF EXISTS analyse_pgrouting.new_shpath2_geom;
+
+CREATE TABLE analyse_pgrouting.new_shpath2_geom AS
+SELECT   sp.seq,            -- séquence du chemin
+    sp.node,           -- noeud actuel
+    sp.edge,           -- id de l’arête
+    sp.cost,           -- coût de l’arête
+    r.id_trc,       -- id de la rue
+    r.geom,            -- géométrie de la rue
+    r.source,
+    r.target
+FROM analyse_pgrouting.new_shpath2 AS sp
+LEFT JOIN analyse_pgrouting.new_reseau AS r
+    ON sp.edge = r.id_trc;
+```
+
+### Visualisation
+
+Pour la visualisation, on revient sur une environnement de programmation en R. Il y a beaucoup de possibilités de visualisations possibles des objets spatiaux en R. Pour la plupart on doit importer les objets de la BD dans l'environnement de travail en R.
+
+```{r}
+
+new_shpath2_sf <- st_read(con, 
+query = "SELECT * 
+   FROM analyse_pgrouting.new_shpath2_geom
+")
+
+# Visu basique
+plot(new_shpath2_sf$geom)
+# Visu interactive
+mapview(new_shpath2_sf)
+```
+### Comparaison avec une bibliothèque R dédiée
+
+Ici je teste mon résultat final avec une biliothèque R qui devrait réaliser exactement ce que fais tout notre code en... une seule ligne. C'est tout le principe des fonctions des biliothèques (packages, extensions, librairies, paquets...), elles permettent de réaliser simplement des opérations en ajoutant des arguments à une fonctions, mais derrière le code qui construit et paramètre la fonction peut être complexe et très long. Je mobilise ici le package '[osrm](https://github.com/riatelab/osrm)'.
+
+```{r}
+# install.packages("osrm")
+library(osrm)
+# On réutilise les objets sf des points de départ et d'arrivée du début du document
+route_osrm <- osrmRoute(src = depart_sf, dst = arrivee_sf)
+mapview(route_osrm) # Visu seule
+mapview(route_osrm) + mapview(new_shpath2_sf) # Comparaison visuelle
+```
+
+Les résultats ne sont pas égaux, pas étonnant car malgré des données issues du même producteur (osm), elles en sont pas similaires en tous points. Les notres sont tirées du livrable du livre en ligne 'Introduction to postgis', mais aussi on a reconstruit le réseau de nôtre côté, il n'est pas mis à jour de manière dynamique.... Par ailleurs il y a certainement des différences avec le calcul : pour estimer le plus court chemin on n'a par exemple pas mis de contraintes sur les qualités du réseau (vitesse, direction....), les moyens de transport... Il est fort probable que les procédés des auteur.es de la librairie 'osrm' ont réalisé d'autres choix. La confrontation avec la réalité permettrait de valider telle ou telle méthode. Mais comme nous ne sommes pas à New-York on peut déjà comparer le coût total des deux itinéraires.
+
+```{r}
+summary(route_osrm) # 2035 m pour l'itinéraire proposé par osrm
+sum(new_shpath2_sf$cost) # 1932 m pour l'itinéraire proposé par notre méthode. Mais attention, nous sommes respectivement à 67 et 70m de nos points de départ et d'arrivée sur le réseau. Donc 1932 +  137 = 2069. 
 ```
