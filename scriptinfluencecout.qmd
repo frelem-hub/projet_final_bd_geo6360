@@ -1,0 +1,534 @@
+---
+title: "merdouille"
+author: "flc"
+format: html
+editor: visual
+---
+
+```{r}
+library(odbc)
+library(DBI)
+library(sf)
+library(tidyverse)
+library(mapview)
+library(tidygeocoder)
+library(osrm)
+```
+
+```{r}
+con_init <- dbConnect(odbc::odbc(),
+  Driver   = "PostgreSQL Unicode",
+  Database = "postgres",
+  Server   = "localhost",
+  UID      = "postgres",
+  PWD      = "donneeslemig2025"
+)
+
+if (!("projet_final_test16avril" %in% dbGetQuery(con_init, "SELECT datname FROM pg_database")$datname)) {
+  dbExecute(con_init, "CREATE DATABASE projet_final_test16avril")
+}
+
+dbDisconnect(con_init)
+```
+
+```{r}
+con <- dbConnect(odbc::odbc(),
+  Driver   = "PostgreSQL Unicode",
+  Database = "projet_final_test16avril",
+  Server   = "localhost",
+  UID      = "postgres",
+  PWD      = "donneeslemig2025"
+)
+```
+
+```{sql, connection = con}
+CREATE EXTENSION IF NOT EXISTS postgis;
+CREATE SCHEMA IF NOT EXISTS data;
+
+DROP TABLE IF EXISTS data.bixi_stations;
+CREATE TABLE data.bixi_stations (
+    station_id     TEXT PRIMARY KEY,
+    external_id    TEXT,
+    name           TEXT,
+    short_name     TEXT,
+    capacity       INTEGER,
+    rental_methods TEXT[],
+    is_charging    BOOLEAN,
+    has_kiosk      BOOLEAN,
+    geom           GEOMETRY(Point, 4326)
+);
+
+DROP TABLE IF EXISTS tmp_bixi;
+CREATE TEMP TABLE tmp_bixi (data jsonb);
+```
+
+```{r}
+bixi_raw <- readr::read_file("https://gbfs.velobixi.com/gbfs/fr/station_information.json")
+DBI::dbExecute(con, "INSERT INTO tmp_bixi VALUES (?)", list(bixi_raw))
+```
+
+```{sql, connection = con}
+INSERT INTO data.bixi_stations
+SELECT
+    elem->>'station_id',
+    elem->>'external_id',
+    elem->>'name',
+    elem->>'short_name',
+    (elem->>'capacity')::int,
+    ARRAY(SELECT jsonb_array_elements_text(elem->'rental_methods')),
+    (elem->>'is_charging')::boolean,
+    (elem->>'has_kiosk')::boolean,
+    ST_SetSRID(ST_MakePoint((elem->>'lon')::float, (elem->>'lat')::float), 4326)
+FROM tmp_bixi, jsonb_array_elements(data->'data'->'stations') AS elem
+ON CONFLICT (station_id) DO NOTHING;
+```
+
+```{sql, connection = con}
+DROP TABLE IF EXISTS data.reseau_routier;
+CREATE TABLE data.reseau_routier (
+    id_trc    INTEGER PRIMARY KEY,
+    nom_voie  TEXT,
+    typ_voie  TEXT,
+    odonyme   TEXT,
+    arr_gch   TEXT,
+    arr_drt   TEXT,
+    sens_cir  SMALLINT,
+    classe    SMALLINT,
+    geom      GEOMETRY(LineString, 4326)
+);
+
+DROP TABLE IF EXISTS tmp_resrout;
+CREATE TEMP TABLE tmp_resrout (data jsonb);
+```
+
+```{r}
+resrout_raw <- readr::read_file("https://montreal-prod.storage.googleapis.com/resources/9d3d60d8-4e7f-493e-8d6a-dcd040319d8d/geobase.json?X-Goog-Algorithm=GOOG4-RSA-SHA256&X-Goog-Credential=test-datapusher-delete%40amplus-data.iam.gserviceaccount.com%2F20260416%2Fauto%2Fstorage%2Fgoog4_request&X-Goog-Date=20260416T144200Z&X-Goog-Expires=604800&X-Goog-SignedHeaders=host&x-goog-signature=28e85ed07d730c60c0dc4aced7006636096f233be477195ad39ed1ffa93e4136d1ba66f488c7534224af01dde6d5023b46b42b7df23f338b5e1dfd91f3a2271eec559d537781c76a7c035bc95e466dc423eed531129bb6611435d48b320456805e2a111b65f53e17e9f0d234b200d0dc1f99f55474280c5f40c64b1a16e7d9d4a6622659fdc74a64f482de3645877d1357339176aeb0bb1436b565678f855e7c635090134d38c477b5b50eb1aeeb92fd2ddd67bb041d0beaaf9ee4e42140a55a067d6a8563f0504305dcf6c9972bb634315a6b39f16815597d8d4fcff010960f41fecd285345000525ba1df26b5c5891dab66d1538f5353068efacfe10072c4e") 
+DBI::dbExecute(con, "INSERT INTO tmp_resrout VALUES (?)", list(resrout_raw))
+```
+
+```{sql, connection = con}
+INSERT INTO data.reseau_routier
+SELECT
+    (feat->'properties'->>'ID_TRC')::int,
+    feat->'properties'->>'NOM_VOIE',
+    feat->'properties'->>'TYP_VOIE',
+    feat->'properties'->>'ODONYME',
+    feat->'properties'->>'ARR_GCH',
+    feat->'properties'->>'ARR_DRT',
+    (feat->'properties'->>'SENS_CIR')::smallint,
+    (feat->'properties'->>'CLASSE')::smallint,
+    ST_SetSRID(ST_GeomFromGeoJSON(feat->>'geometry'), 4326)
+FROM tmp_resrout, jsonb_array_elements(data->'features') AS feat
+ON CONFLICT (id_trc) DO NOTHING;
+```
+
+```{sql, connection = con}
+DROP TABLE IF EXISTS data.pistes_cyclables;
+CREATE TABLE data.pistes_cyclables (
+    id_cycl    BIGSERIAL PRIMARY KEY,  -- BIGSERIAL auto-incrémenté, garde le même nom
+    type_voie  TEXT,
+    protege_4s TEXT,
+    saisons4   TEXT,
+    longueur   INTEGER,
+    geom       GEOMETRY(LineString, 4326)
+);
+
+DROP TABLE IF EXISTS tmp_cyclable;
+CREATE TEMP TABLE tmp_cyclable (data jsonb);
+```
+
+```{r}
+cyclable_raw <- readr::read_file("https://montreal-prod.storage.googleapis.com/resources/0dc6612a-be66-406b-b2d9-59c9e1c65ebf/reseau_cyclable.geojson?X-Goog-Algorithm=GOOG4-RSA-SHA256&X-Goog-Credential=test-datapusher-delete%40amplus-data.iam.gserviceaccount.com%2F20260416%2Fauto%2Fstorage%2Fgoog4_request&X-Goog-Date=20260416T155120Z&X-Goog-Expires=604800&X-Goog-SignedHeaders=host&x-goog-signature=bfbb68adbb1e47a50706af3f983d5d3c817d6798d3dab5ab0af7217235476440ae2964f6cb50902ca28e7accd6a95d27e7370fac8b2d37b8efedce2a6d80810c5c5241528dd5f193839c980b2fb77087428f23097e8ee27ec433f13151f3cc248871d52001038c7088ca344527ef79ca3ee4216539a30753bdd985343040f935db08d8de7bf406551b5d7b6871c86a7484e80ff0a844e7542480976059103eed8fd60bee87384be87027196c6db93a4ae567a656f741943c8696543761e9894141c57144239edb71755d7f0993d4801719c1342e74af5e55862837d24d0592835efbc7eb89e0bf014d916c1009d4f59cbddfa8f2c076336ef9412e0d2acc3a8e") 
+DBI::dbExecute(con, "INSERT INTO tmp_cyclable VALUES (?)", list(cyclable_raw))
+```
+
+```{sql, connection = con}
+INSERT INTO data.pistes_cyclables (type_voie, protege_4s, saisons4, longueur, geom)
+SELECT
+    feat->'properties'->>'TYPE_VOIE_DESC',
+    feat->'properties'->>'PROTEGE_4S',
+    feat->'properties'->>'SAISONS4',
+    (feat->'properties'->>'LONGUEUR')::int,
+    (ST_Dump(ST_SetSRID(ST_GeomFromGeoJSON(feat->>'geometry'), 4326))).geom
+FROM tmp_cyclable, jsonb_array_elements(data->'features') AS feat
+ON CONFLICT (id_cycl) DO NOTHING;
+```
+
+```{sql, connection = con}
+SELECT 'bixi_stations'   AS table_name, COUNT(*) FROM data.bixi_stations
+UNION ALL
+SELECT 'reseau_routier',  COUNT(*) FROM data.reseau_routier
+UNION ALL
+SELECT 'pistes_cyclables', COUNT(*) FROM data.pistes_cyclables;
+```
+
+```{sql, connection = con}
+CREATE INDEX ON data.bixi_stations   USING GIST (geom);
+CREATE INDEX ON data.reseau_routier  USING GIST (geom);
+CREATE INDEX ON data.pistes_cyclables USING GIST (geom);
+```
+
+```{sql, connection = con}
+CREATE EXTENSION IF NOT EXISTS pgrouting;
+CREATE SCHEMA IF NOT EXISTS analyse_pgrouting;
+SET search_path = analyse_pgrouting, data, public;
+```
+
+```{sql, connection = con}
+DROP TABLE IF EXISTS analyse_pgrouting.reseau;
+CREATE TABLE analyse_pgrouting.reseau AS
+SELECT id_trc::BIGINT, (ST_Dump(geom)).geom AS geom
+FROM data.reseau_routier;
+```
+
+```{sql, connection = con}
+DROP TABLE IF EXISTS analyse_pgrouting.new_reseau;
+CREATE TABLE analyse_pgrouting.new_reseau AS
+WITH
+points_intersection AS (
+    SELECT DISTINCT ST_Intersection(a.geom, b.geom) AS geom
+    FROM analyse_pgrouting.reseau a
+    JOIN analyse_pgrouting.reseau b ON a.id_trc < b.id_trc
+    WHERE ST_Intersects(a.geom, b.geom)
+      AND GeometryType(ST_Intersection(a.geom, b.geom)) = 'POINT'
+),
+decoupage_ligne AS (
+    SELECT (ST_Dump(ST_Split(r.geom, pts.geom))).geom AS geom
+    FROM analyse_pgrouting.reseau AS r
+    CROSS JOIN (SELECT ST_Union(geom) AS geom FROM points_intersection) AS pts
+)
+SELECT DISTINCT geom
+FROM decoupage_ligne
+WHERE GeometryType(geom) = 'LINESTRING';
+```
+
+```{sql, connection = con}
+DROP SEQUENCE IF EXISTS analyse_pgrouting.street_seq;
+CREATE SEQUENCE analyse_pgrouting.street_seq START 1;
+ALTER TABLE analyse_pgrouting.new_reseau ADD COLUMN IF NOT EXISTS id_trc BIGINT;
+UPDATE analyse_pgrouting.new_reseau SET id_trc = nextval('analyse_pgrouting.street_seq');
+```
+
+```{sql, connection = con}
+CREATE INDEX IF NOT EXISTS idx_geom_newreseau ON analyse_pgrouting.new_reseau USING GIST (geom);
+```
+
+```{sql, connection = con}
+ALTER TABLE analyse_pgrouting.new_reseau DROP COLUMN IF EXISTS source;
+ALTER TABLE analyse_pgrouting.new_reseau ADD COLUMN "source" BIGINT;
+ALTER TABLE analyse_pgrouting.new_reseau DROP COLUMN IF EXISTS target;
+ALTER TABLE analyse_pgrouting.new_reseau ADD COLUMN "target" BIGINT;
+ALTER TABLE analyse_pgrouting.new_reseau DROP COLUMN IF EXISTS cost;
+ALTER TABLE analyse_pgrouting.new_reseau ADD COLUMN cost REAL;
+UPDATE analyse_pgrouting.new_reseau SET cost = ST_Length(geom::geography);
+```
+
+```{sql, connection = con}
+-- Ajout du coût pondéré selon les pistes cyclables
+ALTER TABLE analyse_pgrouting.new_reseau DROP COLUMN IF EXISTS cost_pondere;
+ALTER TABLE analyse_pgrouting.new_reseau ADD COLUMN cost_pondere REAL;
+
+-- Initialisation à coût normal
+UPDATE analyse_pgrouting.new_reseau SET cost_pondere = cost * 1.0;
+
+-- Application des facteurs selon le type de voie cyclable
+-- MIN() retient le facteur le plus avantageux si plusieurs pistes couvrent le tronçon
+UPDATE analyse_pgrouting.new_reseau r
+SET cost_pondere = cost * facteur
+FROM (
+    SELECT r2.id_trc,
+        MIN(CASE c.type_voie
+            WHEN 'Piste cyclable en site propre'        THEN 0.3
+            WHEN 'Piste cyclable sur rue'               THEN 0.4
+            WHEN 'Piste cyclable au niveau du trottoir' THEN 0.4
+            WHEN 'Vélorue'                              THEN 0.5
+            WHEN 'Bande cyclable'                       THEN 0.6
+            WHEN 'Sentier polyvalent'                   THEN 0.7
+            WHEN 'Voie partagée Bus-Vélo'               THEN 0.8
+            WHEN 'Chaussée désignée'                    THEN 0.9
+            ELSE 1.0
+        END) AS facteur
+    FROM analyse_pgrouting.new_reseau r2
+    JOIN data.pistes_cyclables c ON ST_DWithin(r2.geom, c.geom, 0.0001)
+    GROUP BY r2.id_trc
+) sub
+WHERE r.id_trc = sub.id_trc;
+```
+
+```{sql, connection = con}
+DROP TABLE IF EXISTS analyse_pgrouting.new_reseau_vertices;
+SELECT * INTO analyse_pgrouting.new_reseau_vertices
+FROM pgr_extractVertices('SELECT id_trc AS id, geom FROM analyse_pgrouting.new_reseau');
+```
+
+```{sql, connection = con}
+CREATE INDEX IF NOT EXISTS idx_geom_newreseau_vertices ON analyse_pgrouting.new_reseau_vertices USING GIST (geom);
+```
+
+```{sql, connection = con}
+UPDATE analyse_pgrouting.new_reseau AS r
+SET source = v.id
+FROM analyse_pgrouting.new_reseau_vertices AS v
+WHERE ST_DWithin(ST_StartPoint(r.geom), v.geom, 0.000001);
+```
+
+```{sql, connection = con}
+UPDATE analyse_pgrouting.new_reseau AS r
+SET target = v.id
+FROM analyse_pgrouting.new_reseau_vertices AS v
+WHERE ST_DWithin(ST_EndPoint(r.geom), v.geom, 0.000001);
+```
+
+```{sql, connection = con}
+DROP TABLE IF EXISTS analyse_pgrouting.pt_depart;
+CREATE TABLE IF NOT EXISTS analyse_pgrouting.pt_depart (
+    osm_id BIGINT, address TEXT, geog geography(POINT,4326)
+)
+```
+
+```{sql, connection = con}
+DROP TABLE IF EXISTS analyse_pgrouting.pt_arrivee;
+CREATE TABLE IF NOT EXISTS analyse_pgrouting.pt_arrivee (
+    osm_id BIGINT, address TEXT, geog geography(POINT,4326)
+)
+```
+
+```{r}
+adresse_depart  <- "3029 Boulevard Édouard Montpetit, Montréal, Québec, H3T 1S1, Canada"
+adresse_arrivee <- "1375 Avenue Thérèse-Lavoie-Roux, Montréal, Québec, H2V 0B3, Canada"
+```
+
+```{r}
+coord_depart <- tidygeocoder::geo(address = adresse_depart, method = "osm", verbose = TRUE, full_results = TRUE)
+depart_sf <- sf::st_as_sf(coord_depart, coords = c("long", "lat"), crs = 4326) %>%
+  select(osm_id, address, geometry) %>%
+  rename(geog = geometry)
+
+coord_arrivee <- geo(address = adresse_arrivee, method = "osm", verbose = TRUE, full_results = TRUE)
+arrivee_sf <- sf::st_as_sf(coord_arrivee, coords = c("long", "lat"), crs = 4326) %>%
+  select(osm_id, address, geometry) %>%
+  rename(geog = geometry)
+```
+
+```{sql, connection = con}
+DROP TABLE IF EXISTS analyse_pgrouting.pt_depart_bixi;
+CREATE TABLE analyse_pgrouting.pt_depart_bixi (
+    id         BIGSERIAL PRIMARY KEY,
+    osm_id     BIGINT,
+    station_id TEXT,
+    name       TEXT,
+    distance   DOUBLE PRECISION,
+    geom       GEOMETRY(Point, 4326)
+);
+```
+
+```{sql, connection = con}
+DROP TABLE IF EXISTS analyse_pgrouting.pt_depart_reseau;
+CREATE TABLE analyse_pgrouting.pt_depart_reseau (
+    id       BIGSERIAL PRIMARY KEY,
+    osm_id   BIGINT,
+    id_noeud BIGINT,
+    distance DOUBLE PRECISION
+);
+```
+
+```{sql, connection = con}
+-- Trigger 1 départ : adresse → station BIXI la plus proche
+CREATE OR REPLACE FUNCTION fct_depart_bixi()
+RETURNS TRIGGER AS $$
+BEGIN
+    INSERT INTO analyse_pgrouting.pt_depart_bixi (
+        osm_id, station_id, name, distance, geom
+    )
+    SELECT
+        NEW.osm_id,
+        b.station_id,
+        b.name,
+        ST_Distance(NEW.geog, b.geom::geography),
+        b.geom
+    FROM data.bixi_stations b
+    ORDER BY NEW.geog <-> b.geom::geography
+    LIMIT 1;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+```
+
+```{sql, connection = con}
+DROP TRIGGER IF EXISTS trg_fct_depart_bixi ON analyse_pgrouting.pt_depart;
+
+CREATE TRIGGER trg_fct_depart_bixi
+AFTER INSERT ON analyse_pgrouting.pt_depart
+FOR EACH ROW
+EXECUTE FUNCTION fct_depart_bixi();
+```
+
+```{sql, connection = con}
+-- Trigger 2 départ : station BIXI → nœud réseau le plus proche
+CREATE OR REPLACE FUNCTION fct_depart_node_network()
+RETURNS TRIGGER AS $$
+BEGIN
+    INSERT INTO analyse_pgrouting.pt_depart_reseau (
+        osm_id, id_noeud, distance
+    )
+    SELECT
+        NEW.osm_id,
+        n.id,
+        ST_Distance(NEW.geom::geography, n.geom::geography)
+    FROM analyse_pgrouting.new_reseau_vertices n
+    ORDER BY NEW.geom::geography <-> n.geom::geography
+    LIMIT 1;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+```
+
+```{sql, connection = con}
+DROP TRIGGER IF EXISTS trg_fct_depart_node_network ON analyse_pgrouting.pt_depart_bixi;
+
+CREATE TRIGGER trg_fct_depart_node_network
+AFTER INSERT ON analyse_pgrouting.pt_depart_bixi
+FOR EACH ROW
+EXECUTE FUNCTION fct_depart_node_network();
+```
+
+```{r}
+dbWriteTable(con, Id(schema = "analyse_pgrouting", table = "pt_depart"),
+             value = depart_sf, append = TRUE, row.names = FALSE)
+```
+
+```{sql, connection = con}
+DROP TABLE IF EXISTS analyse_pgrouting.pt_arrivee_bixi;
+CREATE TABLE analyse_pgrouting.pt_arrivee_bixi (
+    id         BIGSERIAL PRIMARY KEY,
+    osm_id     BIGINT,
+    station_id TEXT,
+    name       TEXT,
+    distance   DOUBLE PRECISION,
+    geom       GEOMETRY(Point, 4326)
+);
+```
+
+```{sql, connection = con}
+DROP TABLE IF EXISTS analyse_pgrouting.pt_arrivee_reseau;
+CREATE TABLE analyse_pgrouting.pt_arrivee_reseau (
+    id       BIGSERIAL PRIMARY KEY,
+    osm_id   BIGINT,
+    id_noeud BIGINT,
+    distance DOUBLE PRECISION
+);
+```
+
+```{sql, connection = con}
+-- Trigger 1 arrivée : adresse → station BIXI la plus proche
+CREATE OR REPLACE FUNCTION fct_arrivee_bixi()
+RETURNS TRIGGER AS $$
+BEGIN
+    INSERT INTO analyse_pgrouting.pt_arrivee_bixi (
+        osm_id, station_id, name, distance, geom
+    )
+    SELECT
+        NEW.osm_id,
+        b.station_id,
+        b.name,
+        ST_Distance(NEW.geog, b.geom::geography),
+        b.geom
+    FROM data.bixi_stations b
+    ORDER BY NEW.geog <-> b.geom::geography
+    LIMIT 1;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+```
+
+```{sql, connection = con}
+DROP TRIGGER IF EXISTS trg_fct_arrivee_bixi ON analyse_pgrouting.pt_arrivee;
+
+CREATE TRIGGER trg_fct_arrivee_bixi
+AFTER INSERT ON analyse_pgrouting.pt_arrivee
+FOR EACH ROW
+EXECUTE FUNCTION fct_arrivee_bixi();
+```
+
+```{sql, connection = con}
+-- Trigger 2 arrivée : station BIXI → nœud réseau le plus proche
+CREATE OR REPLACE FUNCTION fct_arrivee_node_network()
+RETURNS TRIGGER AS $$
+BEGIN
+    INSERT INTO analyse_pgrouting.pt_arrivee_reseau (
+        osm_id, id_noeud, distance
+    )
+    SELECT
+        NEW.osm_id,
+        n.id,
+        ST_Distance(NEW.geom::geography, n.geom::geography)
+    FROM analyse_pgrouting.new_reseau_vertices n
+    ORDER BY NEW.geom::geography <-> n.geom::geography
+    LIMIT 1;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+```
+
+```{sql, connection = con}
+DROP TRIGGER IF EXISTS trg_fct_arrivee_node_network ON analyse_pgrouting.pt_arrivee_bixi;
+
+CREATE TRIGGER trg_fct_arrivee_node_network
+AFTER INSERT ON analyse_pgrouting.pt_arrivee_bixi
+FOR EACH ROW
+EXECUTE FUNCTION fct_arrivee_node_network();
+```
+
+```{r}
+dbWriteTable(con, Id(schema = "analyse_pgrouting", table = "pt_arrivee"),
+             value = arrivee_sf, append = TRUE, row.names = FALSE)
+```
+
+```{sql, connection = con}
+DROP TABLE IF EXISTS analyse_pgrouting.new_shpath2;
+CREATE TABLE analyse_pgrouting.new_shpath2 AS
+SELECT *
+FROM pgr_dijkstra(
+    'SELECT id_trc AS id, source::INT4, target::INT4, cost_pondere AS cost
+     FROM analyse_pgrouting.new_reseau
+     WHERE source IS NOT NULL AND target IS NOT NULL'::text,
+    (SELECT id_noeud FROM analyse_pgrouting.pt_depart_reseau ORDER BY id DESC LIMIT 1),
+    (SELECT id_noeud FROM analyse_pgrouting.pt_arrivee_reseau ORDER BY id DESC LIMIT 1),
+    false
+);
+```
+
+```{sql, connection = con}
+DROP TABLE IF EXISTS analyse_pgrouting.new_shpath2_geom;
+CREATE TABLE analyse_pgrouting.new_shpath2_geom AS
+SELECT
+    sp.seq,
+    sp.node,
+    sp.edge,
+    sp.cost,
+    r.id_trc,
+    r.geom,
+    r.cost          AS cost_reel_m,    -- distance réelle en mètres
+    r.cost_pondere  AS cost_pondere_m, -- coût pondéré utilisé par Dijkstra
+    r.source,
+    r.target
+FROM analyse_pgrouting.new_shpath2 AS sp
+LEFT JOIN analyse_pgrouting.new_reseau AS r ON sp.edge = r.id_trc;
+```
+
+```{r}
+new_shpath2_sf <- st_read(con, query = "SELECT * FROM analyse_pgrouting.new_shpath2_geom")
+
+plot(new_shpath2_sf$geom)
+mapview(new_shpath2_sf)
+```
+
+```{r}
+route_osrm <- osrmRoute(src = depart_sf, dst = arrivee_sf)
+mapview(route_osrm) + mapview(new_shpath2_sf)
+```
+
+```{r}
+summary(route_osrm)
+sum(new_shpath2_sf$cost_reel_m, na.rm = TRUE) # distance réelle du trajet en mètres
+```
