@@ -11,18 +11,36 @@ library(DBI)  # provides functions to interact with the database
 library(sf) # Bibliothèque pour l'analyse et traitement des données spatiales
 library(tidyverse) # Data science tools
 library(mapview) # Visu rapide et dynamique des objets spatiaux
-library(tidygeocoder)
-library(osrm)
+library(tidygeocoder) # bibliothèque pour géocodage
+library(osrm) # bibliothèque avec routing à partir d'OSM pour comparer
+```
+
+```{r}
+
+con_init <- dbConnect(odbc::odbc(),
+  Driver   = "PostgreSQL Unicode",
+  Database = "postgres",          # BD système par défaut
+  Server   = "localhost",
+  UID      = "postgres",
+  PWD      = "donneeslemig2025"
+)
+
+# Création de la BD si elle n'existe pas déjà
+if (!("projet_final_test16avril" %in% dbGetQuery(con_init, "SELECT datname FROM pg_database")$datname)) {
+  dbExecute(con_init, "CREATE DATABASE projet_final_test16avril")
+}
+
+dbDisconnect(con_init) # On ferme la connexion initiale
 ```
 
 ```{r}
 
 con<- dbConnect(odbc::odbc(),
  Driver = "PostgreSQL Unicode",
- Database = "projet_final_test4avril",
+ Database = "projet_final_test16avril",
  Server = "localhost",
  UID = "postgres",
- PWD = "donneeslemig2025" # Ne jamais diffuser un mdp personnel
+ PWD = "donneeslemig2025"
 )
 ```
 
@@ -61,6 +79,7 @@ CREATE TEMP TABLE tmp_bixi (data jsonb);
 # passe en r pour accéder au fichier directement sur internet
 
 bixi_raw <- readr::read_file("https://gbfs.velobixi.com/gbfs/fr/station_information.json")
+
 DBI::dbExecute(con, "INSERT INTO tmp_bixi VALUES (?)", list(bixi_raw))
 
 # SI LE LIEN EST BRISÉ, simplement spécifier un chemin vers le fichier en local
@@ -116,7 +135,8 @@ CREATE TEMP TABLE tmp_resrout (data jsonb);
 
 # passe en r pout accéder au fichier avec un chemin de client local
 
-resrout_raw <- readr::read_file("https://urls.fr/6e0Uog") #lien réduit parce que l'original est trop long
+resrout_raw <- readr::read_file("https://montreal-prod.storage.googleapis.com/resources/9d3d60d8-4e7f-493e-8d6a-dcd040319d8d/geobase.json")
+
 DBI::dbExecute(con, "INSERT INTO tmp_resrout VALUES (?)", list(resrout_raw))
 
 # SI LE LIEN EST BRISÉ, simplement spécifier un chemin vers le fichier en local
