@@ -72,7 +72,7 @@ CREATE TABLE data.bixi_stations (
     short_name     TEXT,              
     capacity       INTEGER,           
     rental_methods TEXT[],            
-    is_charging    BOOLEAN,            ?
+    is_charging    BOOLEAN,            
     has_kiosk      BOOLEAN,           
     geom           GEOMETRY(Point, 4326)  
 );
