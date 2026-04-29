@@ -8,11 +8,11 @@ editor: visual
 ```{r}
 # Chargement des bibliothèques nécessaires pour le projet
 library(odbc)        # Fournit les pilotes pour se connecter à différents types de bases de données SQL
-library(DBI)         # Fournit les fonctions génériques pour interagir avec la base de données (dbConnect, dbExecute...)
+library(DBI)         # Fournit les fonctions génériques pour interagir avec la base de données (dbConnect, dbExecute, etc)
 library(sf)          # Bibliothèque pour l'analyse et le traitement des données spatiales (lecture, écriture, manipulation de géométries)
 library(tidyverse)   # Collection d'outils pour la science des données (manipulation, visualisation, import de données)
 library(mapview)     # Visualisation rapide et interactive des objets spatiaux dans R
-library(tidygeocoder) # Bibliothèque de géocodage : transforme des adresses textuelles en coordonnées géographiques
+library(tidygeocoder) # Bibliothèque de géocodage. transforme des adresses textuelles en coordonnées géographiques
 library(osrm)        # Bibliothèque de calcul d'itinéraires basée sur OpenStreetMap, utilisée ici pour comparer avec notre résultat
 ```
 
@@ -30,7 +30,7 @@ con_init <- dbConnect(odbc::odbc(),
 
 # Vérifie si la base de données "projet_final_test16avril" existe déjà
 # dbGetQuery retourne la liste de toutes les BD existantes, on vérifie si la nôtre est dedans
-# Si elle n'existe pas (!), on la crée avec CREATE DATABASE
+# Si elle n'existe pas, on la crée avec CREATE DATABASE
 if (!("projet_final_test16avril" %in% dbGetQuery(con_init, "SELECT datname FROM pg_database")$datname)) {
   dbExecute(con_init, "CREATE DATABASE projet_final_test16avril")
 }
@@ -64,25 +64,24 @@ DROP TABLE IF EXISTS data.bixi_stations;
 
 -- Création de la table qui accueillera les stations BIXI
 -- On définit les colonnes en mimant la structure du JSON source
--- GEOMETRY(Point, 4326) : colonne spatiale de type point en coordonnées WGS84 (GPS standard)
+-- GEOMETRY(Point, 4326) : colonne spatiale de type point en coordonnées WGS84
 CREATE TABLE data.bixi_stations (
-    station_id     TEXT PRIMARY KEY,  -- Identifiant unique de la station (clé primaire)
-    external_id    TEXT,              -- Identifiant externe (autre système)
-    name           TEXT,              -- Nom de la station
-    short_name     TEXT,              -- Nom court
-    capacity       INTEGER,           -- Nombre de vélos que la station peut accueillir
-    rental_methods TEXT[],            -- Tableau des méthodes de location (carte, clé...)
-    is_charging    BOOLEAN,           -- La station est-elle une borne de recharge ?
-    has_kiosk      BOOLEAN,           -- La station a-t-elle un kiosque ?
-    geom           GEOMETRY(Point, 4326)  -- Géométrie du point (localisation de la station)
+    station_id     TEXT PRIMARY KEY,  
+    external_id    TEXT,            
+    name           TEXT,              
+    short_name     TEXT,              
+    capacity       INTEGER,           
+    rental_methods TEXT[],            
+    is_charging    BOOLEAN,            ?
+    has_kiosk      BOOLEAN,           
+    geom           GEOMETRY(Point, 4326)  
 );
 
 -- Suppression de la table temporaire si elle existe déjà
 DROP TABLE IF EXISTS tmp_bixi;
 
 -- Création d'une table temporaire pour stocker le JSON brut des stations BIXI
--- TEMP : cette table n'existe que pendant la session, elle sera détruite automatiquement à la fermeture
--- jsonb : format JSON binaire de PostgreSQL, plus efficace pour les requêtes
+-- jsonb : format JSON binaire de PostgreSQL
 CREATE TEMP TABLE tmp_bixi (data jsonb);
 ```
 
@@ -90,7 +89,7 @@ CREATE TEMP TABLE tmp_bixi (data jsonb);
 # Lecture du fichier JSON des stations BIXI directement depuis le flux GBFS (General Bikeshare Feed Specification)
 # GBFS est le standard ouvert pour les données des systèmes de vélos en libre-service
 # read_file() lit le contenu du fichier comme une simple chaîne de texte
-bixi_raw <- readr::read_file("https://gbfs.velobixi.com/gbfs/fr/station_information.json")
+bixi_raw <- readr::read_file("https://gbfs.velobixi.com/gbfs/gbfs.json")
 
 # Injection du JSON brut dans la table temporaire via un paramètre (?) pour éviter les problèmes d'échappement
 # On passe par R pour accéder au fichier car la commande COPY de PostgreSQL ne peut lire que des fichiers côté serveur
@@ -148,7 +147,7 @@ CREATE TEMP TABLE tmp_resrout (data jsonb);
 ```{r}
 # Lecture du réseau routier depuis les données ouvertes de la Ville de Montréal
 # Le lien est signé temporairement (valide 7 jours) via Google Cloud Storage
-resrout_raw <- readr::read_file("https://montreal-prod.storage.googleapis.com/resources/9d3d60d8-4e7f-493e-8d6a-dcd040319d8d/geobase.json?X-Goog-Algorithm=GOOG4-RSA-SHA256&X-Goog-Credential=test-datapusher-delete%40amplus-data.iam.gserviceaccount.com%2F20260416%2Fauto%2Fstorage%2Fgoog4_request&X-Goog-Date=20260416T144200Z&X-Goog-Expires=604800&X-Goog-SignedHeaders=host&x-goog-signature=28e85ed07d730c60c0dc4aced7006636096f233be477195ad39ed1ffa93e4136d1ba66f488c7534224af01dde6d5023b46b42b7df23f338b5e1dfd91f3a2271eec559d537781c76a7c035bc95e466dc423eed531129bb6611435d48b320456805e2a111b65f3e17e9f0d234b200d0dc1f99f55474280c5f40c64b1a16e7d9d4a6622659fdc74a64f482de3645877d1357339176aeb0bb1436b565678f855e7c635090134d38c477b5b50eb1aeeb92fd2ddd67bb041d0beaaf9ee4e42140a55a067d6a8563f0504305dcf6c9972bb634315a6b39f16815597d8d4fcff010960f41fecd285345000525ba1df26b5c5891dab66d1538f5353068efacfe10072c4e") 
+resrout_raw <- readr::read_file("https://montreal-prod.storage.googleapis.com/resources/9d3d60d8-4e7f-493e-8d6a-dcd040319d8d/geobase.json?X-Goog-Algorithm=GOOG4-RSA-SHA256&X-Goog-Credential=test-datapusher-delete%40amplus-data.iam.gserviceaccount.com%2F20260429%2Fauto%2Fstorage%2Fgoog4_request&X-Goog-Date=20260429T143346Z&X-Goog-Expires=604800&X-Goog-SignedHeaders=host&x-goog-signature=3f30fd1eac4ae2552f38935c2f1256ab0274dfad341f2478d881067ef91e8a248277c345bf3cd2e8213095fa7513dd57df6b0c607123f73f75847300cf23b122fbe4f13ce2cc12ef7b667c2fa9f64d0d037eaa1ec05438b008818470f887de06c7860baebdfe0d3119934bc16c914a968bf5c1372f47d22fad3a627cb207a6fee8639b0a5c0983aafff75950033bf48fcbf3caf492673253be743730742a45ef3c783dba7faa972ad64f2e42e00059e934846ccfa9968f3602152af84cc9f049eb35a31d761d1a1c13061d302bd14b68c8a4ca0aa6e59cb608134a30581bfa3267a471d7a02c1a194836d5e7c07e446764c7215990cfb66564e35a45567af00f") 
 DBI::dbExecute(con, "INSERT INTO tmp_resrout VALUES (?)", list(resrout_raw))
 ```
 
@@ -193,7 +192,7 @@ CREATE TEMP TABLE tmp_cyclable (data jsonb);
 
 ```{r}
 # Lecture du réseau cyclable depuis les données ouvertes de la Ville de Montréal
-cyclable_raw <- readr::read_file("https://montreal-prod.storage.googleapis.com/resources/0dc6612a-be66-406b-b2d9-59c9e1c65ebf/reseau_cyclable.geojson?X-Goog-Algorithm=GOOG4-RSA-SHA256&X-Goog-Credential=test-datapusher-delete%40amplus-data.iam.gserviceaccount.com%2F20260416%2Fauto%2Fstorage%2Fgoog4_request&X-Goog-Date=20260416T155120Z&X-Goog-Expires=604800&X-Goog-SignedHeaders=host&x-goog-signature=bfbb68adbb1e47a50706af3f983d5d3c817d6798d3dab5ab0af7217235476440ae2964f6cb50902ca28e7accd6a95d27e7370fac8b2d37b8efedce2a6d80810c5c5241528dd5f193839c980b2fb77087428f23097e8ee27ec433f13151f3cc248871d52001038c7088ca344527ef79ca3ee4216539a30753bdd985343040f935db08d8de7bf406551b5d7b6871c86a7484e80ff0a844e7542480976059103eed8fd60bee87384be87027196c6db93a4ae567a656f741943c8696543761e9894141c57144239edb71755d7f0993d4801719c1342e74af5e55862837d24d0592835efbc7eb89e0bf014d916c1009d4f59cbddfa8f2c076336ef9412e0d2acc3a8e") 
+cyclable_raw <- readr::read_file("https://montreal-prod.storage.googleapis.com/resources/0dc6612a-be66-406b-b2d9-59c9e1c65ebf/reseau_cyclable.geojson?X-Goog-Algorithm=GOOG4-RSA-SHA256&X-Goog-Credential=test-datapusher-delete%40amplus-data.iam.gserviceaccount.com%2F20260429%2Fauto%2Fstorage%2Fgoog4_request&X-Goog-Date=20260429T143351Z&X-Goog-Expires=604800&X-Goog-SignedHeaders=host&x-goog-signature=1a84aff70fa500fef0fa1c425868c7c497a3a2ffd0db01c91ef94b17f7d9e3a4d17715bcbdb70d8d4453686fff924a132e1d009cc9ab9568d62d6f28a8d3006b867702c459447f1daad7989d6004e156d6ca4081038f8133863bc525c5686dba29d317d0b9e84332d85c26aade8051f2084d592cfffecbc416dad1360594dea01bea1c7e61c7f755cd06263144a4db1710a1458c831f65a968a42fece618efd495ddfffae60e29d7b225834d2fc95dd2a01ee1f9108c39798d784eb5c204a7324dd7c231a11dda5c2a5e2cda746fddc46d5c1d0fe0dd18852bc4bdec077e533df155f6fb6f992ebe1143736c562356374eed98b17005c9cdf3cf16755bac6951") 
 DBI::dbExecute(con, "INSERT INTO tmp_cyclable VALUES (?)", list(cyclable_raw))
 ```
 
